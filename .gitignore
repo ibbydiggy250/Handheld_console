@@ -1,0 +1,25 @@
+# --- ESP-IDF build output ---
+build/
+
+# --- Component manager ---
+# Fetched dependency sources. Reproducible from idf_component.yml +
+# dependencies.lock, so no reason to commit ~MBs of third-party code.
+managed_components/
+
+# --- Config ---
+# COMMIT sdkconfig — it's project configuration (PSRAM octal mode, 8MB flash,
+# partition layout). Without it a fresh clone builds with wrong defaults.
+# Ignore only the auto-generated backup.
+sdkconfig.old
+sdkconfig.defaults.old
+
+# --- Editor / OS ---
+.vscode/ipch/
+.vscode/c_cpp_properties.json
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# --- Misc ---
+*.swp
+*~

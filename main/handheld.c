@@ -8,7 +8,9 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_log.h"
-
+#include "esp_heap_caps.h"
+#include "freertos/semphr.h"
+#include <assert.h>
 
 #define PIN_SCK   12
 #define PIN_MOSI  11
@@ -20,6 +22,17 @@
 
 #define LCD_W 240
 #define LCD_H 320
+
+static SemaphoreHandle_t trans_done_sem;
+
+static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
+                                esp_lcd_panel_io_event_data_t *edata,
+                                void *user_ctx)
+{
+    BaseType_t hp_task_awoken = pdFALSE;
+    xSemaphoreGiveFromISR(trans_done_sem, &hp_task_awoken);
+    return hp_task_awoken == pdTRUE;
+}
 
 void app_main(void)
 {
@@ -38,7 +51,7 @@ void app_main(void)
         .miso_io_num = PIN_MISO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_W * 80 * sizeof(uint16_t),
+        .max_transfer_sz = LCD_W * LCD_H * sizeof(uint16_t),   // 153600
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 
@@ -47,13 +60,20 @@ void app_main(void)
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = PIN_DC,
         .cs_gpio_num = PIN_CS,
-        .pclk_hz = 10 * 1000 * 1000,
+        .pclk_hz = 40 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_cfg, &io));
+    trans_done_sem = xSemaphoreCreateBinary();
+    assert(trans_done_sem != NULL);
+
+    esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = on_color_trans_done,
+    };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io, &cbs, NULL));
 
     // 3. Panel
     esp_lcd_panel_handle_t panel = NULL;
@@ -67,21 +87,28 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+    // Framebuffer in PSRAM
+    size_t fb_size = LCD_W * LCD_H * sizeof(uint16_t);   // 153600
+    uint16_t *fb = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
+    assert(fb != NULL);
+    ESP_LOGI("fb", "framebuffer at %p, %u bytes", fb, (unsigned)fb_size);
 
     // Fill screen, one 240px line at a time
-    static uint16_t line[LCD_W];
     uint16_t colors[] = { 0x00F8, 0xE007, 0x1F00 };  // red, green, blue
 
     while (1) {
         for (int c = 0; c < 3; c++) {
-            for (int x = 0; x < LCD_W; x++) line[x] = colors[c];
+            for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = colors[c];
 
             int64_t t0 = esp_timer_get_time();
-            for (int y = 0; y < LCD_H; y++) {
-                esp_lcd_panel_draw_bitmap(panel, 0, y, LCD_W, y + 1, line);
-            }
-            int64_t t1 = esp_timer_get_time();
-            ESP_LOGI("perf", "full screen fill: %lld us", t1 - t0);
+            esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);
+            int64_t t_cpu = esp_timer_get_time();
+
+            xSemaphoreTake(trans_done_sem, portMAX_DELAY);
+            int64_t t_done = esp_timer_get_time();
+
+            ESP_LOGI("perf", "cpu busy: %lld us | transfer done: %lld us",
+                     t_cpu - t0, t_done - t0);
 
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
