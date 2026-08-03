@@ -74,8 +74,8 @@ No code change moves these numbers. Everything measured above them is overhead.
 | Frame rate | 5.3 fps | 7.7 fps | 24.6 fps |
 | Bus payload (floor) | 122.9 ms | 122.9 ms | 30.7 ms |
 | Overhead | 65.0 ms (34.6%) | 7.8 ms (6.0%) | 10.0 ms (24.6%) |
-| CPU busy | ~188 ms (pinned) | 5.86 ms | *TODO: record* |
-| CPU free | ~0% | 95.5% | *TODO* |
+| CPU busy | ~188 ms (pinned) | 5.86 ms | 5.83 ms |
+| CPU free | ~0% | 95.5% | 85.7% |
 
 Jitter across 20+ consecutive frames was ~0.02% (187867 µs repeated to the microsecond).
 Deltas of even a few percent are trustworthy on this platform.
@@ -115,9 +115,20 @@ DMA there is no CPU left to run it and the project stops at "a screen that works
 
 The 5.9 ms is *not* SPI time — it's dominated by the cache writeback over the
 150 KB PSRAM buffer (DMA must see current data, not stale cache lines), plus the
-CASET/RASET/RAMWR command transactions which are synchronous. Prediction to verify:
-this stays ~5.9 ms at 40 MHz because it's memory-bandwidth bound, not clock bound —
-which would mean the CPU-free fraction *drops* from 95% to ~82% as the bus gets faster.
+CASET/RASET/RAMWR command transactions, which are synchronous.
+
+**Predicted before measuring:** this cost is memory-bandwidth bound, not clock
+bound, so it should stay ~5.9 ms at 40 MHz even though the transfer gets 3.2×
+shorter — meaning the CPU-free fraction should *fall*.
+
+**Confirmed:**
+cpu busy: 5859 us | transfer done: 129122 us @ 10 MHz → 95.5% free
+cpu busy: 5832 us | transfer done: 40711 us @ 40 MHz → 85.7% free
+
+The transfer got 3.2× faster; the CPU cost moved 0.5%, which is noise. Two
+independent bottlenecks. **The fixed cost is what eventually bites, not the wire** —
+extrapolating to 80 MHz (~20 ms transfer) puts CPU-free at ~71%. That's the
+argument for double buffering, and now it's a number rather than a hunch.
 
 ---
 
@@ -212,8 +223,6 @@ half frame N+1 during a scroll. Likely answer is double buffering — needs 300 
 
 ## Open questions
 
-- [ ] Record `cpu busy` at 40 MHz. Does the 5.9 ms hold constant? (Predicted: yes —
-      it's cache-writeback bound, not clock bound.)
 - [ ] Try 80 MHz. Bus floor would be 15.4 ms (~65 fps), but that's well past what
       breadboard wiring is likely to hold. Worth finding the ceiling and writing it down.
 - [ ] Double buffering: measure tearing on a real moving image before deciding.
