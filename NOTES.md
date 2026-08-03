@@ -132,6 +132,108 @@ argument for double buffering, and now it's a number rather than a hunch.
 
 ---
 
+## Step 4 — Input
+
+**Goal:** physical buttons on GPIO, polled in the game loop, debounced in software.
+Start with two to prove the pattern, then expand to six.
+
+### Pin selection
+
+Buttons go on **GPIO 4–9**. Free after the PSRAM reserve (26–37), the strapping pins
+(0, 3, 45, 46), native USB (19, 20), and the display's 10–16.
+
+Chose the 4–9 block over 38–42 for a reason beyond availability: on the S3, only
+**GPIO 0–21 are RTC GPIOs**, and `esp_sleep_enable_ext1_wakeup()` requires an RTC pin.
+Step 10 will want "press a button to wake from deep sleep." Putting buttons on 38–42
+would silently foreclose that. The whole 4–9 block is RTC-capable, so the six-button
+expansion stays wake-capable.
+
+If phantom presses ever appear, GPIO 1 and 2 on the opposite header are the escape
+hatch — also free, also RTC-capable, and physically away from the 40 MHz SPI bundle.
+A 45 kΩ internal pull-up is a high-impedance node; don't run button jumpers parallel
+to SCK/MOSI if it can be avoided.
+
+### Electrical design
+
+**Internal pull-up, switch to ground. Active low: released = 1, pressed = 0.**
+
+No external resistors, no capacitors. Two wires per button.
+
+Chose pull-up over pull-down for two reasons. The ground rail is already distributed
+from the display wiring, so ground is the cheap net to reach. And the failure mode is
+better: if a jumper falls out the pin floats high to "released" rather than latching a
+phantom press.
+
+Active-low is kept all the way through to the input layer rather than normalized at the
+driver, because **the DMG joypad register (`P1`/`JOYP`) also reads 0 for pressed.** In
+Phase 2 the raw pin state maps onto the emulated register with no inversion. Wrapped in
+one place so the convention is stated once:
+
+```c
+static inline bool btn_down(int gpio) { return gpio_get_level(gpio) == 0; }
+```
+
+### Tactile switch pinout — the rule that's actually orientation-independent
+
+A 6×6 mm tactile switch has **4 legs = 2 terminals of 2 legs each.** The two legs of a
+terminal are internally connected; pressing bridges terminal to terminal.
+
+The standard advice is "straddle the center trench and wire the two sides." **That
+advice is wrong, or at least not reliable.** Which physical axis the terminals separate
+along depends on how the part happens to sit in the board, and the switch will happily
+bridge the trench — the trench separates nothing.
+
+Wiring both jumpers to the same terminal produces a pin that reads **0 constantly** and
+does not respond to presses. Removing either jumper sends it back to 1. That's the
+signature.
+
+**The only orientation-independent rule: wire two DIAGONALLY OPPOSITE legs.**
+Diagonal legs are never the same terminal, whichever way the part is turned. Same-side
+and same-row pairs may or may not be, depending on orientation.
+
+Second consequence, easy to miss: **if a terminal spans the trench, that entire row is
+live across both halves of the board.** Rows normally treated as two independent nodes
+become one. Don't park anything else in a row a button occupies, and give the next
+button rows well clear of it.
+
+### Determining the pairing: use the MCU, not the meter
+
+Don't try to establish the pinout with a multimeter. Wire it diagonally, flash a
+polling loop, and read the log:
+
+```c
+gpio_config_t btn_cfg = {
+    .pin_bit_mask = (1ULL << BTN_A_GPIO),
+    .mode         = GPIO_MODE_INPUT,
+    .pull_up_en   = GPIO_PULLUP_ENABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type    = GPIO_INTR_DISABLE,
+};
+ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+```
+
+`1ULL`, not `1` — `pin_bit_mask` is `uint64_t`, and `1 << 38` on a 32-bit int is
+undefined behaviour that compiles clean. Harmless at GPIO 4, bites on a high pin.
+
+Log the raw level before writing any game logic. Three states, all unambiguous:
+
+| Log | Meaning |
+|---|---|
+| Steady 1, 0 while held | Correct. Whole chain proven. |
+| Steady 1, no response | Circuit never closes — legs not in clips, or a jumper on the wrong pin |
+| Steady 0, no response | Both jumpers on the same terminal |
+
+The pull-up makes this self-diagnosing in a way a continuity test isn't.
+
+### Interrupts rejected
+
+Poll in the game loop. GPIO interrupts interact badly with contact bounce — a single
+press fires a burst of edges, and the debounce has to live in an ISR or a deferred
+task either way. Polling at frame rate is simpler, and the game loop already runs on a
+frame clock.
+
+---
+
 ## Decisions
 
 **Framebuffer stored pre-byte-swapped.**
@@ -165,18 +267,62 @@ consensus is that this part overclocks reliably. Revisit if signal integrity deg
 "breadboard parasitics capped SPI at X MHz" would itself be a finding, and an argument
 for the Stage B PCB.
 
+**Buttons on RTC-capable GPIOs (4–9).**
+Costs nothing now, preserves deep-sleep wake for Step 10. See Step 4 above.
+
 ---
 
 ## Gotchas (learned the hard way)
 
+### Instruments
+
+- **A multimeter probe cannot reach a breadboard clip.** The spring contact sits several
+  mm below the surface and the hole is sized for a ~0.6 mm pin; a ~2 mm probe cone wedges
+  in the plastic funnel and stops short. **Bare holes always read open, regardless of
+  what's plugged in.** Seat a jumper and probe its exposed end instead. This produced a
+  false "the legs aren't seated" diagnosis that survived hours of debugging.
+- **Calibrate the meter before trusting a number.** Touch the probe tips together and
+  read the value — that's lead resistance and the floor. Measured **004** here, so
+  anything reading below 004 is noise, not a better connection. On this meter (ANENG
+  DM850) an open circuit displays a bare **`1`** on the left of the screen, not `OL`.
+- **Both probes on the same wire measures the wire, not the circuit.** Beeping proves
+  the jumper is continuous end to end. To test whether two nodes are connected, each
+  probe must be on a *different* conductor with the component between them.
+- **Banana plugs work loose.** A marginal lead reads as a dead short from anything to
+  anything, and it comes and goes as the leads move. Push both plugs fully home, then
+  re-baseline: probes apart must be silent, probes together must beep. If it beeps in
+  open air, stop — nothing downstream means anything.
+- **Probe geometry matters.** Holding both probes in one hand with the tips converging
+  lets them touch each other. One probe per hand, approaching from opposite directions,
+  tips well apart.
+- **Flash before you meter.** The MCU settled in thirty seconds what the meter couldn't
+  in three hours. A configured GPIO with a known pull-up gives an unambiguous binary
+  with no probe geometry, no lead seating, and no dial position to get wrong. For
+  anything on a GPIO, the microcontroller is the better instrument; reach for the meter
+  only for nodes the MCU can't see.
+
+### Wiring
+
+- **Read the silkscreen label, don't count header positions.** The DevKitC-1's left edge
+  runs 3V3, 3V3, RST, 4, 5, 6… so counting to the fourth pin lands several GPIOs off
+  from the pin labelled `4`. A ground jumper that was one position off the `G` pin
+  caused a "shorting to ground does nothing" result that looked like a dead pin.
 - **SPI to the display is write-only — there is no back-channel.** A wrong DC pin,
   swapped MOSI/SCK, wrong SPI host, or a bad init sequence all produce the identical
   symptom: blank screen, zero error output. The chip cannot tell the panel didn't
-  hear it. **Check wiring continuity before flashing**, or a wiring fault and a
-  firmware fault are indistinguishable.
+  hear it.
   Cheap partial test with no meter: move the display's LED wire to 3V3. If the
   backlight lights, VCC/GND/panel are confirmed alive — 3 of 9 wires validated,
   and the fault is isolated to the remaining 6.
+- **Charge-only USB cable.** Board powers up with a solid red LED and never enumerates
+  in Device Manager — looks like a driver problem, isn't. Known-good data cable is now
+  labeled. Also: connect the board directly to the laptop, not through the USB hub.
+  If `idf.py flash` reports "the system cannot find the file specified" on COM3, the
+  port doesn't exist — the board isn't enumerating. Check the **UART** USB connector,
+  not the native USB one.
+
+### Firmware
+
 - **`rgb_ele_order`** wrong = image renders with red and blue swapped. Distinctive and
   self-diagnosing, unlike most display faults. ILI9341 wants `BGR`.
   `spi_mode` must be 0; wrong mode garbles every byte.
@@ -187,9 +333,10 @@ for the Stage B PCB.
   doesn't fetch until CMake reconfigures, so on an already-built project you get
   "No such file or directory" on the new header. **Always `idf.py fullclean` after
   adding a dependency.** Cost me time twice.
-- **Charge-only USB cable.** Board powers up with a solid red LED and never enumerates
-  in Device Manager — looks like a driver problem, isn't. Known-good data cable is now
-  labeled. Also: connect the board directly to the laptop, not through the USB hub.
+- **`idf.py` needs the project root.** It looks for `CMakeLists.txt` in the current
+  directory; running it anywhere else fails with "CMakeLists.txt not found."
+- **`pin_bit_mask` is `uint64_t` — always shift `1ULL`.** `1 << 38` on a 32-bit int is
+  undefined behaviour that compiles without warning.
 - **`max_transfer_sz` sizes the DMA descriptor chain at `spi_bus_initialize()` time.**
   Too small and it fails at *init*, not at runtime. If init succeeded, the size took.
   Cost is small: ~38 descriptors × 12 bytes for a full frame.
@@ -219,6 +366,13 @@ frames; will be a real artifact in Phase 2 when the top half shows frame N and t
 half frame N+1 during a scroll. Likely answer is double buffering — needs 300 KB of the
 8 MB PSRAM, which is affordable.
 
+**Isolate by bypass.** The move that resolved both the display and the input bring-up:
+when a chain of components produces one ambiguous symptom, remove the suspect component
+and test the path around it. Shorting a GPIO straight to ground tests pin + pull-up +
+jumper with the switch out of the circuit entirely — one variable, and it splits the
+candidate faults cleanly. Same shape as moving the display's LED wire to 3V3 to validate
+3 of 9 wires.
+
 ---
 
 ## Open questions
@@ -228,6 +382,13 @@ half frame N+1 during a scroll. Likely answer is double buffering — needs 300 
 - [ ] Double buffering: measure tearing on a real moving image before deciding.
 - [ ] Does partial-region update beat full-frame for mostly-static screens?
       DMG is 160×144 — scaled into 240×320 that's a lot of unchanged border.
+- [ ] Measure actual contact bounce at 5 ms sampling — press edge and release edge
+      separately. Release usually bounces worse (less contact force as the dome
+      snaps back). Set the debounce interval from that number, not from a tutorial.
+- [ ] Breadboard-friendly tactile switches with straight legs are worth buying. The
+      kit parts have splayed retention legs meant for PCB through-holes and fight the
+      0.1" grid. Micro Center stocks a 6×6 mm assortment; the starter kit only has 4
+      switches and the build needs 6.
 
 ---
 
@@ -237,4 +398,7 @@ half frame N+1 during a scroll. Likely answer is double buffering — needs 300 
   proven end-to-end. RGB LED on GPIO38 via `led_strip` over the RMT peripheral.
 - **Step 2 — Display bring-up.** ✅ Aug 1 2026. ILI9341 cycling full-screen R/G/B over SPI.
 - **Step 3 — PSRAM framebuffer + DMA.** ✅ Aug 2 2026. 4.62× faster, 95% of CPU recovered.
-- **Step 4 — Input.** Next: draw a square, move it with buttons, software debounce.
+- **Step 4 — Input.** 🔧 Aug 3 2026. First button reading clean 1/0 on GPIO 4 with
+  internal pull-up. Next: measure bounce at 5 ms, add debounce, second button, moving
+  square. Most of the elapsed time went to instrument error, not circuit error — see
+  Gotchas → Instruments.

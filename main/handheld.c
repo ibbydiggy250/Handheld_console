@@ -19,6 +19,7 @@
 #define PIN_DC    14
 #define PIN_RST   15
 #define PIN_BL    16
+#define BTN_A_GPIO 4
 
 #define LCD_W 240
 #define LCD_H 320
@@ -33,7 +34,17 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
     xSemaphoreGiveFromISR(trans_done_sem, &hp_task_awoken);
     return hp_task_awoken == pdTRUE;
 }
-
+static void buttons_init(void)
+{
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BTN_A_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+}
 void app_main(void)
 {
     // Backlight on
@@ -92,6 +103,12 @@ void app_main(void)
     uint16_t *fb = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
     assert(fb != NULL);
     ESP_LOGI("fb", "framebuffer at %p, %u bytes", fb, (unsigned)fb_size);
+
+    buttons_init();
+    while (1) {
+        ESP_LOGI("btn", "level=%d", gpio_get_level(BTN_A_GPIO));
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     // Fill screen, one 240px line at a time
     uint16_t colors[] = { 0x00F8, 0xE007, 0x1F00 };  // red, green, blue
