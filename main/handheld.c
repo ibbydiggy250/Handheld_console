@@ -30,11 +30,9 @@
 #define BTN_RIGHT  1
 #define BTN_COUNT  2
 
-// GPIO 4-9 are free and RTC-capable (needed for ext1 deep-sleep wake in Step 10).
-// GPIO 5 is not physically wired yet -- the pull-up makes it read "released".
 static const int btn_gpios[BTN_COUNT] = { 4, 5 };
 
-// Measured bounce was ~487 us worst case (release edge). At the ~40 ms frame
+// Measured bounce was ~165 us worst case (release edge). At the ~40 ms frame
 // clock a single confirming sample is already generous; 2 is cheap insurance
 // against a glitch landing exactly on a sample boundary.
 #define DEBOUNCE_SAMPLES 2
@@ -177,6 +175,19 @@ void app_main(void)
 
     // 5. Input
     buttons_init();
+    //-------------------------------------------------------------- debounce testing
+    /*
+    int64_t t_start = esp_timer_get_time();
+    int last = gpio_get_level(btn_gpios[0]);
+    while (esp_timer_get_time() - t_start < 15000000) {
+        int now = gpio_get_level(btn_gpios[0]);
+        if (now != last) {
+            ESP_LOGI("bounce", "%d at %lld", now, esp_timer_get_time());
+            last = now;
+        }
+    }
+    */
+    ESP_LOGI("bounce", "window closed");
 
     int sq_x = (LCD_W - SQ_SIZE) / 2;
     int sq_y = (LCD_H - SQ_SIZE) / 2;

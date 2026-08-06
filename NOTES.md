@@ -25,6 +25,8 @@ All on the DevKitC-1 left edge; 10–14 are five consecutive pins.
 The five `T_*` pins (XPT2046 touch controller) are intentionally unwired — touch is out of scope.
 SD slot shares SCK/MOSI/MISO and will need only its own CS in Step 6.
 
+**Button wiring:** GPIO 4 (left), GPIO 5 (right). Internal pull-up, switch to ground.
+
 **Pin selection constraints:** GPIO 26–37 are unusable — the octal PSRAM owns them.
 Strapping pins (0, 3, 45, 46) and native USB (19, 20) also excluded. That leaves
 4–18 and 38–42. Chose 11/12/13 for MOSI/SCK/MISO because they're SPI2's IO_MUX
@@ -130,12 +132,16 @@ independent bottlenecks. **The fixed cost is what eventually bites, not the wire
 extrapolating to 80 MHz (~20 ms transfer) puts CPU-free at ~71%. That's the
 argument for double buffering, and now it's a number rather than a hunch.
 
+**Re-confirmed in Step 4** on a different workload: with a render pass added, the
+fixed cost measured 14034 − 8216 = **5818 µs**, against 5832 µs in Step 3. Within
+noise, and now corroborated across two builds doing different amounts of work.
+
 ---
 
 ## Step 4 — Input
 
 **Goal:** physical buttons on GPIO, polled in the game loop, debounced in software.
-Start with two to prove the pattern, then expand to six.
+Two buttons to prove the pattern, expandable to six.
 
 ### Pin selection
 
@@ -166,12 +172,35 @@ phantom press.
 
 Active-low is kept all the way through to the input layer rather than normalized at the
 driver, because **the DMG joypad register (`P1`/`JOYP`) also reads 0 for pressed.** In
-Phase 2 the raw pin state maps onto the emulated register with no inversion. Wrapped in
-one place so the convention is stated once:
+Phase 2 the raw pin state maps onto the emulated register with no inversion.
+
+### The expansion seam
+
+Buttons are addressed by **index, not by pin**, with the count derived from the array:
 
 ```c
-static inline bool btn_down(int gpio) { return gpio_get_level(gpio) == 0; }
+#define BTN_LEFT   0
+#define BTN_RIGHT  1
+#define BTN_COUNT  2
+
+static const int btn_gpios[BTN_COUNT] = { 4, 5 };
 ```
+
+Every loop is `for (i = 0; i < BTN_COUNT; i++)`. Nothing above the GPIO layer knows a
+pin number or a button count. Adding the remaining four buttons is: bump `BTN_COUNT`,
+add the index defines, add the pins to `btn_gpios`. No other edit.
+
+`btn_down()` takes the index and is the single place the active-low convention is
+stated:
+
+```c
+static inline bool btn_down(int b) { return btns[b].stable; }
+```
+
+Only two buttons are wired now, and that is the correct scope — the Step 9 game is
+Pong or Snake, and the CHIP-8 port (Step 11) needs a handful of keys at most. Pong is
+two per player; Tetris is left/rotate/right/drop. The full 16-key CHIP-8 keypad is a
+spec detail no ROM in hand actually exercises.
 
 ### Tactile switch pinout — the rule that's actually orientation-independent
 
@@ -203,7 +232,7 @@ polling loop, and read the log:
 
 ```c
 gpio_config_t btn_cfg = {
-    .pin_bit_mask = (1ULL << BTN_A_GPIO),
+    .pin_bit_mask = mask,            // OR of (1ULL << gpio) for each button
     .mode         = GPIO_MODE_INPUT,
     .pull_up_en   = GPIO_PULLUP_ENABLE,
     .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -225,12 +254,120 @@ Log the raw level before writing any game logic. Three states, all unambiguous:
 
 The pull-up makes this self-diagnosing in a way a continuity test isn't.
 
+### Contact bounce — measured
+
+**A game-loop press counter cannot measure bounce.** At a 50 ms frame clock the loop
+samples 20×/sec; any bounce burst finishes entirely between two samples. A counter
+driven off frame-rate polling reads exactly N for N presses whether or not a single
+line of debounce logic exists. That is a green test carrying zero information.
+
+Measured instead with a dedicated tight loop, run once before the game loop, timestamping
+every level change on GPIO 4:
+
+```c
+int64_t t_start = esp_timer_get_time();
+int last = gpio_get_level(btn_gpios[0]);
+while (esp_timer_get_time() - t_start < 15000000) {
+    int now = gpio_get_level(btn_gpios[0]);
+    if (now != last) {
+        ESP_LOGI("bounce", "%d at %lld", now, esp_timer_get_time());
+        last = now;
+    }
+}
+```
+
+**Results — 11 presses:**
+
+| | |
+|---|---|
+| Presses showing bounce | 3 of 11 (~27%) |
+| Edge affected | **Release only.** No press edge bounced once. |
+| Burst duration | ~165 µs max |
+| Transitions per burst | 2 extra |
+| Resolution floor | **~82 µs** (see below) |
+
+Sample burst:
+
+```
+8153929 (0)  press
+8318222 (1)  release
+8318303 (0)  ← +81 us
+8318384 (1)  ← +81 us
+```
+
+**The asymmetry is the real finding.** Releases bounce, presses don't. Mechanically
+consistent: on press the dome is driven closed under finger force; on release it
+separates under spring force alone with no damping.
+
+**The 82 µs figure is the instrument, not the switch.** Intervals across three
+independent bursts were 81, 81, 85, 84, 85, 84 µs — far too regular for mechanical
+bounce. `ESP_LOGI` blocks while pushing bytes to UART, so during a burst the effective
+sample period is the log-print time, not the loop period. **Bounce finer than ~82 µs is
+invisible to this method.** Honest claim: *burst under ~250 µs on release; fine
+structure unresolved.*
+
+### Debounce implementation
+
+**N consecutive agreeing samples**, not a millisecond lockout:
+
+```c
+#define DEBOUNCE_SAMPLES 2
+```
+
+A state only changes after it reads the same way N polls in a row. One counter per
+button, no timestamps, and it degrades gracefully if loop rate drifts. A fixed-time
+lockout would need retuning every time frame timing changes — and frame timing *will*
+change in Phase 2.
+
+**Margin:** 165 µs bounce against a 50,000 µs frame clock is ~300×. Even at a 16 ms
+Phase 2 frame time it's ~100×. `DEBOUNCE_SAMPLES 2` is insurance against switches not
+yet measured — the six-button expansion may include parts that behave worse — not
+against anything observed on these.
+
 ### Interrupts rejected
 
 Poll in the game loop. GPIO interrupts interact badly with contact bounce — a single
 press fires a burst of edges, and the debounce has to live in an ISR or a deferred
 task either way. Polling at frame rate is simpler, and the game loop already runs on a
 frame clock.
+
+**Measured poll cost: 2 µs** for two buttons, including debounce state machine.
+Rounding error against a 50 ms frame. Six buttons will not change that.
+
+### The render cost — double buffering, argued a second way
+
+Adding a render pass moved the frame from **40.7 ms → 50.0 ms**:
+
+```
+input 2 us | render 8216 us | cpu 14034 us | frame 49999 us
+```
+
+Frame time decomposes cleanly:
+
+| Stage | Time | Notes |
+|---|---|---|
+| Input poll | 2 µs | negligible |
+| Render (clear + square) | 8216 µs | 153,600 B written to PSRAM |
+| DMA setup / cache writeback | 5818 µs | matches Step 3's 5832 µs |
+| DMA transfer | ~35,965 µs | CPU idle, blocked on semaphore |
+| **Total** | **49,999 µs** | 20.0 fps |
+
+The 8.2 ms render is **serialized, not overlapped**. Single-buffered means frame N+1
+cannot start rendering until DMA finishes reading frame N, so render time adds directly
+to the frame instead of hiding underneath the transfer.
+
+**This is the same conclusion as Step 3's extrapolation, reached independently.** Step 3
+argued double buffering from a fixed cost that would grow as a fraction when the bus got
+faster. Step 4 argues it from a render cost that is pure serialization overhead today.
+With two buffers the 8.2 ms disappears under the 36 ms transfer: **50.0 ms → ~41.8 ms,
+20.0 → 23.9 fps, ~1.20×** — before touching the SPI clock.
+
+Cost is 153,600 more bytes of the 8 MB PSRAM. Measured twice, from two directions, is a
+stronger case than either alone.
+
+Jitter note: `frame 49999 us` repeated to the microsecond across every sample, matching
+the ~0.02% determinism seen in Step 3. This platform's timing is trustworthy enough that
+small deltas mean something.
 
 ---
 
@@ -270,6 +407,13 @@ for the Stage B PCB.
 **Buttons on RTC-capable GPIOs (4–9).**
 Costs nothing now, preserves deep-sleep wake for Step 10. See Step 4 above.
 
+**Debounce by sample count, not by elapsed time.**
+Survives frame-rate changes without retuning. Phase 2 will change frame rate.
+
+**Active-low carried through to the input layer, not normalized.**
+The DMG joypad register reads 0 for pressed. Normalizing here would mean inverting
+back in Phase 2.
+
 ---
 
 ## Gotchas (learned the hard way)
@@ -300,6 +444,15 @@ Costs nothing now, preserves deep-sleep wake for Step 10. See Step 4 above.
   with no probe geometry, no lead seating, and no dial position to get wrong. For
   anything on a GPIO, the microcontroller is the better instrument; reach for the meter
   only for nodes the MCU can't see.
+- **`ESP_LOGI` is a blocking instrument and it sets the resolution floor.** Printing
+  inside a sampling loop means the sample period is the UART write time, not the loop
+  time. Measured ~82 µs on this build. Suspiciously regular intervals in timing data
+  are the tell — mechanical events don't repeat to the microsecond. To resolve finer,
+  buffer timestamps in RAM and print after the window closes.
+- **A test that cannot fail is not a test.** Before trusting a passing measurement,
+  break it deliberately — set the debounce window to zero, or sample slower than the
+  event — and confirm the result changes. If it doesn't, the test isn't measuring what
+  it claims to.
 
 ### Wiring
 
@@ -335,6 +488,19 @@ Costs nothing now, preserves deep-sleep wake for Step 10. See Step 4 above.
   adding a dependency.** Cost me time twice.
 - **`idf.py` needs the project root.** It looks for `CMakeLists.txt` in the current
   directory; running it anywhere else fails with "CMakeLists.txt not found."
+- **Code placed after the game loop's `while (1)` is unreachable and produces no
+  warning.** A diagnostic block appended to the bottom of `app_main` silently never
+  runs. The tell is in the log timestamps: if the first `perf` line lands ~1.5 s after
+  boot, nothing before the loop took any time. Temporary instrumentation goes *above*
+  the loop.
+- **A tight polling loop starves IDLE0 and trips the task watchdog at exactly 5 s.** It
+  fires on a free-running timeout, repeating every 5 s, and has nothing to do with what
+  the code is doing at that moment — chasing it as if it correlates with an input event
+  wastes time. Panic is off by default, so it's log noise and no reboot. Cannot be fed
+  from the offending loop: it's the *idle* task being starved, not this one. Fix by
+  keeping the window under ~4 s, or accept the noise.
+- **`vTaskDelay(1)` is 10 ms at the default tick rate.** Far too coarse to sample sub-
+  millisecond events. Any loop that needs to observe bounce cannot yield.
 - **`pin_bit_mask` is `uint64_t` — always shift `1ULL`.** `1 << 38` on a 32-bit int is
   undefined behaviour that compiles without warning.
 - **`max_transfer_sz` sizes the DMA descriptor chain at `spi_bus_initialize()` time.**
@@ -364,7 +530,8 @@ the panel painting top-to-bottom slow enough for the eye to follow. At 40 ms it 
 instant. Nothing changed about how it paints, only the speed. Harmless with solid-color
 frames; will be a real artifact in Phase 2 when the top half shows frame N and the bottom
 half frame N+1 during a scroll. Likely answer is double buffering — needs 300 KB of the
-8 MB PSRAM, which is affordable.
+8 MB PSRAM, which is affordable. Step 4's render-serialization measurement is the second
+independent reason to do it.
 
 **Isolate by bypass.** The move that resolved both the display and the input bring-up:
 when a chain of components produces one ambiguous symptom, remove the suspect component
@@ -373,18 +540,27 @@ jumper with the switch out of the circuit entirely — one variable, and it spli
 candidate faults cleanly. Same shape as moving the display's LED wire to 3V3 to validate
 3 of 9 wires.
 
+**Frame timing is deterministic to the microsecond.** `49999 us` repeated across every
+logged frame, matching the ~0.02% jitter seen in Step 3. Useful property: A/B changes of
+even a few percent are measurable here without averaging.
+
 ---
 
 ## Open questions
 
 - [ ] Try 80 MHz. Bus floor would be 15.4 ms (~65 fps), but that's well past what
       breadboard wiring is likely to hold. Worth finding the ceiling and writing it down.
-- [ ] Double buffering: measure tearing on a real moving image before deciding.
+- [ ] Double buffering: now argued from two independent measurements (Step 3
+      extrapolation, Step 4 render serialization). Predicted gain ~1.20× at 40 MHz.
+      Implement and confirm against the prediction.
 - [ ] Does partial-region update beat full-frame for mostly-static screens?
       DMG is 160×144 — scaled into 240×320 that's a lot of unchanged border.
-- [ ] Measure actual contact bounce at 5 ms sampling — press edge and release edge
-      separately. Release usually bounces worse (less contact force as the dome
-      snaps back). Set the debounce interval from that number, not from a tutorial.
+- [ ] Resolve bounce fine structure below 82 µs: buffer timestamps to a RAM array in the
+      sampling loop, print after the window closes. Would establish whether the observed
+      ~165 µs burst is two transitions or many.
+- [ ] Re-measure bounce on the four additional switches when the six-button set is wired.
+      `DEBOUNCE_SAMPLES 2` is sized for unmeasured parts, not for the two characterized
+      ones.
 - [ ] Breadboard-friendly tactile switches with straight legs are worth buying. The
       kit parts have splayed retention legs meant for PCB through-holes and fight the
       0.1" grid. Micro Center stocks a 6×6 mm assortment; the starter kit only has 4
@@ -398,7 +574,11 @@ candidate faults cleanly. Same shape as moving the display's LED wire to 3V3 to 
   proven end-to-end. RGB LED on GPIO38 via `led_strip` over the RMT peripheral.
 - **Step 2 — Display bring-up.** ✅ Aug 1 2026. ILI9341 cycling full-screen R/G/B over SPI.
 - **Step 3 — PSRAM framebuffer + DMA.** ✅ Aug 2 2026. 4.62× faster, 95% of CPU recovered.
-- **Step 4 — Input.** 🔧 Aug 3 2026. First button reading clean 1/0 on GPIO 4 with
-  internal pull-up. Next: measure bounce at 5 ms, add debounce, second button, moving
-  square. Most of the elapsed time went to instrument error, not circuit error — see
-  Gotchas → Instruments.
+- **Step 4 — Input.** ✅ Aug 5 2026. Two buttons on GPIO 4/5, internal pull-up, active
+  low, polled at frame rate with 2-sample debounce. Square moves under button control.
+  Bounce characterized: ~165 µs, release edge only, ~27% of presses, resolution floor
+  ~82 µs set by the logging instrument. Poll cost 2 µs. Render pass measured at 8.2 ms
+  serialized — second independent argument for double buffering. Most of the elapsed
+  time went to instrument error, not circuit error — see Gotchas → Instruments.
+- **Step 5 — Audio.** Next: beep on button press over I2S (MAX98357A). Passive buzzer
+  from the starter kit is a cheaper sanity check first.
