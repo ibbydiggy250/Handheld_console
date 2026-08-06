@@ -740,8 +740,6 @@ executing once per pixel or once per sample has to be a table, not a computation
 - [ ] Re-measure bounce on the four additional switches when the six-button set is wired.
       `DEBOUNCE_SAMPLES 2` is sized for unmeasured parts, not for the two characterized
       ones.
-- [ ] Find the usable amplitude range. 3200 (~10% FS) was audible but quiet. Sweep up
-      and find where clipping starts, so 5b has a known ceiling.
 - [ ] Why is `sinf` ~18 µs? Flash cache miss per call, or a software double-precision
       fallback? Worth ten minutes with a table-based comparison — the answer generalizes
       to every float in the Phase 2 hot path.
@@ -773,7 +771,16 @@ executing once per pixel or once per sample has to be a table, not a computation
   buffer handoff, not on playback — which looks exactly like a sample-rate bug and
   isn't. Passive-buzzer sanity check was deliberately skipped: LEDC PWM shares nothing
   with the I2S path.
-- **Step 5b — Audio integration.** Next: move playback into the frame loop, trigger from
-  `btn_down()`, non-blocking top-up, square wave or wavetable instead of `sinf`. Measure
-  the per-frame cost alongside `input` / `render` / `cpu` and confirm it fits the budget
-  Step 3 bought.
+- **Step 5b — Audio integration.** ✅ Aug 6 2026. Audio moved into the game loop:
+  square wave (integer compare, no `sinf`), triggered on the button *press edge* via a
+  new `btn_went_down()`, non-blocking `i2s_channel_write` (timeout 0) topped up once per
+  frame. Persistent phase accumulator carries the waveform across frame boundaries — no
+  seam click, confirmed by ear. Generation cost 94 us/beep-frame, ~1 us idle (vs. ~10 ms
+  the same samples would cost via `sinf`) — the square-wave-not-`sinf` argument now
+  measured on both sides. An 80 ms beep spreads cleanly across ~2 frames; the DMA buffer
+  never ran dry (accepted count held at 1128 B, below the offered chunk), so the feared
+  1.3× cushion is comfortable for short beeps. Clean beeps, no click, no stutter under
+  rapid presses. Second-core audio task (Step 7) left unbuilt — no measurement justifies
+  it. **Phase 1 Stage A core subsystems (display, framebuffer/DMA, input, audio) are now
+  all proven.**
+

@@ -14,7 +14,6 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <math.h>
 
 #define PIN_SCK   12
 #define PIN_MOSI  11
@@ -34,17 +33,109 @@
 #define PIN_I2S_DOUT  GPIO_NUM_40
 
 #define SAMPLE_RATE   22050
-#define TONE_HZ       880
-#define TONE_AMP      3200        // ~10% of full scale; leaves clipping headroom
-#define TONE_SAMPLES  SAMPLE_RATE // 1 second
+#define BEEP_HZ       880
+#define BEEP_AMP      8000        // ~24% FS; louder than 5a's 3200, still headroom
+#define BEEP_MS       80          // how long one press sounds
+
+// A chunk sized a bit over one 50 ms frame's worth of samples (~1103). The
+// non-blocking write self-limits to the DMA buffer's free space, so offering
+// slightly more than a frame's drain keeps the buffer topped up; the surplus
+// we generate but can't hand over gets regenerated next frame from the same
+// phase, so nothing is skipped and there's no click at the seam.
+#define AUDIO_CHUNK   1536
+
+// Half a square-wave period, in samples. At 22050 Hz / 880 Hz this is 12,
+// so the emitted tone is 22050/(12*2) = ~919 Hz -- integer rounding shifts
+// the pitch slightly, which is inaudible for a beep.
+#define BEEP_HALF     (SAMPLE_RATE / (BEEP_HZ * 2))
+
+static i2s_chan_handle_t audio_tx = NULL;
+
+static int      beep_remaining = 0;   // samples of tone left to play; 0 = silent
+static uint32_t beep_phase     = 0;   // where in the cycle we are; PERSISTS across
+                                      // frames so the waveform never discontinuities
+static int16_t  audio_buf[AUDIO_CHUNK];
+
+static void audio_init(void)
+{
+    i2s_chan_config_t chan_cfg =
+        I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // Underrun replays the stale DMA buffer otherwise -- a loud repeating
+    // fragment instead of silence. With this, "don't write" == silence, which
+    // is why the channel can stay enabled permanently and we just skip the
+    // write when nothing is playing.
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &audio_tx, NULL));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = PIN_I2S_BCLK,
+            .ws   = PIN_I2S_WS,
+            .dout = PIN_I2S_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = { false, false, false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(audio_tx, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(audio_tx));
+    // Left enabled for the whole program -- see auto_clear note above.
+}
+
+// Arm a beep. Just sets the sample countdown; the loop does the actual work.
+static void audio_beep(void)
+{
+    beep_remaining = SAMPLE_RATE * BEEP_MS / 1000;
+}
+
+// Called once per frame, non-blocking. Generates up to a chunk of square wave
+// and hands it to the DMA buffer. Returns bytes the buffer actually accepted --
+// the underrun gauge: if it swallows everything every frame, the buffer was
+// empty when we arrived and we're on the edge of a click.
+static size_t audio_feed(void)
+{
+    if (beep_remaining <= 0) {
+        return 0;   // nothing playing; auto_clear makes the buffer go silent
+    }
+
+    int n = beep_remaining < AUDIO_CHUNK ? beep_remaining : AUDIO_CHUNK;
+
+    // Generate from a LOCAL copy of the phase so we can advance the real phase
+    // by only the samples that actually get written. Square wave: high for the
+    // first half of each period, low for the second.
+    uint32_t ph = beep_phase;
+    for (int i = 0; i < n; i++) {
+        audio_buf[i] = (ph < BEEP_HALF) ? BEEP_AMP : -BEEP_AMP;
+        if (++ph >= BEEP_HALF * 2) ph = 0;
+    }
+
+    size_t written = 0;
+    // timeout 0: take what fits right now, don't wait for the buffer to drain.
+    i2s_channel_write(audio_tx, audio_buf, n * sizeof(int16_t), &written, 0);
+
+    int samples_written = written / sizeof(int16_t);
+
+    // Advance the persistent phase by ONLY what was accepted, so the samples we
+    // generated but the buffer didn't take are regenerated identically next
+    // frame -- continuous waveform, no seam click.
+    beep_phase = (beep_phase + samples_written) % (BEEP_HALF * 2);
+    beep_remaining -= samples_written;
+
+    return written;
+}
 
 // ---------------------------------------------------------------- buttons
 
 #define BTN_LEFT   0
 #define BTN_RIGHT  1
-#define BTN_COUNT  2
+#define BTN_UP 2
+#define BTN_DOWN 3
+#define BTN_COUNT  4
 
-static const int btn_gpios[BTN_COUNT] = { 4, 5 };
+static const int btn_gpios[BTN_COUNT] = { 4, 5, 6, 7 };
 
 // Measured bounce was ~165 us worst case (release edge). At the ~40 ms frame
 // clock a single confirming sample is already generous; 2 is cheap insurance
@@ -55,6 +146,7 @@ typedef struct {
     bool stable;     // debounced state, true = pressed
     bool candidate;  // most recent raw reading
     int  count;      // consecutive samples agreeing with candidate
+    bool went_down;  // true for exactly one poll when stable goes false->true
 } btn_state_t;
 
 static btn_state_t btns[BTN_COUNT];
@@ -79,6 +171,7 @@ static void buttons_init(void)
         btns[i].stable    = false;
         btns[i].candidate = false;
         btns[i].count     = 0;
+        btns[i].went_down = false;
     }
 }
 
@@ -88,6 +181,7 @@ static void buttons_init(void)
 static void buttons_poll(void)
 {
     for (int i = 0; i < BTN_COUNT; i++) {
+        btns[i].went_down = false;   // clear the one-shot edge each poll
         bool raw = (gpio_get_level(btn_gpios[i]) == 0);
 
         if (raw != btns[i].candidate) {
@@ -95,13 +189,16 @@ static void buttons_poll(void)
             btns[i].count = 1;
         } else if (raw != btns[i].stable) {
             if (++btns[i].count >= DEBOUNCE_SAMPLES) {
+                bool was = btns[i].stable;
                 btns[i].stable = raw;
+                if (!was && raw) btns[i].went_down = true;  // false->true edge
             }
         }
     }
 }
 
-static inline bool btn_down(int b) { return btns[b].stable; }
+static inline bool btn_down(int b)      { return btns[b].stable; }
+static inline bool btn_went_down(int b) { return btns[b].went_down; }
 
 // ---------------------------------------------------------------- display
 
@@ -189,81 +286,9 @@ void app_main(void)
 
     // 5. Input
     buttons_init();
-    //-------------------------------------------------------------- debounce testing
-    /*
-    int64_t t_start = esp_timer_get_time();
-    int last = gpio_get_level(btn_gpios[0]);
-    while (esp_timer_get_time() - t_start < 15000000) {
-        int now = gpio_get_level(btn_gpios[0]);
-        if (now != last) {
-            ESP_LOGI("bounce", "%d at %lld", now, esp_timer_get_time());
-            last = now;
-        }
-    }
-    */
-    ESP_LOGI("bounce", "window closed");
 
-    // ------------------------------------------------------------ 5a: audio
-    // Temporary bring-up block. Proves the whole chain -- I2S peripheral,
-    // three wires, MAX98357A, speaker -- before any game logic can be a
-    // suspect. I2S is write-only like SPI: a wrong pin, wrong slot mode, or
-    // bad clock config all produce identical silence with zero error output.
-    // Must live ABOVE the game loop; code after while(1) is unreachable and
-    // produces no warning.
-    {
-        i2s_chan_handle_t tx = NULL;
-
-        i2s_chan_config_t chan_cfg =
-            I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-        // Underrun replays the stale DMA buffer otherwise -- a loud repeating
-        // fragment instead of silence.
-        chan_cfg.auto_clear = true;
-        ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx, NULL));
-
-        i2s_std_config_t std_cfg = {
-            .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = PIN_I2S_BCLK,
-                .ws   = PIN_I2S_WS,
-                .dout = PIN_I2S_DOUT,
-                .din  = I2S_GPIO_UNUSED,
-                .invert_flags = { false, false, false },
-            },
-        };
-        ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx, &std_cfg));
-        ESP_ERROR_CHECK(i2s_channel_enable(tx));
-
-        int16_t *tone = malloc(TONE_SAMPLES * sizeof(int16_t));
-        ESP_ERROR_CHECK(tone ? ESP_OK : ESP_ERR_NO_MEM);
-
-        // Sine, not square: a square already sounds buzzy, so it can't
-        // distinguish "correct" from "clipping". Sine's failure modes are
-        // audible -- warble is clock config, crackle is underrun or a loose
-        // speaker wire, harshness is clipping. 5b switches to square, which
-        // is what the CHIP-8 sound timer and DMG channels actually want.
-        int64_t t0 = esp_timer_get_time();
-        for (int i = 0; i < TONE_SAMPLES; i++) {
-            tone[i] = (int16_t)(TONE_AMP *
-                       sinf(2.0f * (float)M_PI * TONE_HZ * i / SAMPLE_RATE));
-        }
-        ESP_LOGI("audio", "generated %d samples in %lld us",
-                 TONE_SAMPLES, esp_timer_get_time() - t0);
-
-        size_t written = 0;
-        t0 = esp_timer_get_time();
-        ESP_ERROR_CHECK(i2s_channel_write(tx, tone,
-                                          TONE_SAMPLES * sizeof(int16_t),
-                                          &written, portMAX_DELAY));
-        ESP_LOGI("audio", "wrote %u bytes in %lld us (expect ~1000000)",
-                 (unsigned)written, esp_timer_get_time() - t0);
-
-        free(tone);
-        ESP_ERROR_CHECK(i2s_channel_disable(tx));
-        ESP_ERROR_CHECK(i2s_del_channel(tx));
-    }
+    // 6. Audio -- channel created once, enabled for the whole program.
+    audio_init();
 
     int sq_x = (LCD_W - SQ_SIZE) / 2;
     int sq_y = (LCD_H - SQ_SIZE) / 2;
@@ -275,6 +300,11 @@ void app_main(void)
 
         // --- input
         buttons_poll();
+        // Beep on the press EDGE, not the level -- holding a button would
+        // otherwise re-arm the tone every frame and it would stutter.
+        if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT)) {
+            audio_beep();
+        }
         if (btn_down(BTN_LEFT))  sq_x -= SQ_SPEED;
         if (btn_down(BTN_RIGHT)) sq_x += SQ_SPEED;
 
@@ -282,6 +312,11 @@ void app_main(void)
         if (sq_x > LCD_W - SQ_SIZE)   sq_x = LCD_W - SQ_SIZE;
 
         int64_t t_input = esp_timer_get_time();
+
+        // --- audio top-up. Non-blocking; feeds the DMA buffer whatever the
+        // current beep needs, then returns. audio_bytes is the underrun gauge.
+        size_t audio_bytes = audio_feed();
+        int64_t t_audio = esp_timer_get_time();
 
         // --- render into the framebuffer
         for (int i = 0; i < LCD_W * LCD_H; i++) {
@@ -301,15 +336,18 @@ void app_main(void)
         int64_t t_cpu = esp_timer_get_time();
 
         // Single-buffered: must not touch fb again until DMA has finished
-        // reading it. This wait is also what yields the CPU to IDLE.
+        // reading it. This wait is also what yields the CPU to IDLE -- and it
+        // is the ~36 ms window the audio DMA buffer has to play through on its
+        // own, since the CPU tops up audio only once per trip around the loop.
         xSemaphoreTake(trans_done_sem, portMAX_DELAY);
         int64_t t_done = esp_timer_get_time();
 
         if (++frame % 30 == 0) {
             ESP_LOGI("perf",
-                     "input %lld us | render %lld us | cpu %lld us | frame %lld us",
+                     "input %lld | audio %lld (%u B) | render %lld | cpu %lld | frame %lld us",
                      t_input  - t0,
-                     t_render - t_input,
+                     t_audio  - t_input, (unsigned)audio_bytes,
+                     t_render - t_audio,
                      t_cpu    - t0,
                      t_done   - t0);
         }
