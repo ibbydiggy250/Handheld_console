@@ -14,6 +14,7 @@ Written as I go so the README doesn't have to be reconstructed from memory later
 | CPU clock | 160 MHz, dual core |
 | PSRAM clock | 40 MHz, **octal mode** (quad is the IDF default and silently fails on N8R8) |
 | Display | HiLetgo ILI9341, 240×320, SPI |
+| Audio | MAX98357A I2S class-D amp → 28 mm 8 Ω 2 W speaker |
 | Framework | ESP-IDF v6.0.2 |
 | Display driver | `esp_lcd` + `espressif/esp_lcd_ili9341` v2.0.2 |
 
@@ -26,6 +27,9 @@ The five `T_*` pins (XPT2046 touch controller) are intentionally unwired — tou
 SD slot shares SCK/MOSI/MISO and will need only its own CS in Step 6.
 
 **Button wiring:** GPIO 4 (left), GPIO 5 (right). Internal pull-up, switch to ground.
+
+**Audio wiring:** BCLK=42, LRC/WS=41, DIN=40, Vin=3V3, GND=G.
+`GAIN` and `SD` deliberately left floating — see Step 5.
 
 **Pin selection constraints:** GPIO 26–37 are unusable — the octal PSRAM owns them.
 Strapping pins (0, 3, 45, 46) and native USB (19, 20) also excluded. That leaves
@@ -371,6 +375,150 @@ small deltas mean something.
 
 ---
 
+## Step 5a — Audio bring-up (I2S transport)
+
+**Goal:** prove the whole audio chain — I2S peripheral → three wires → MAX98357A →
+speaker — before any game logic can be a suspect.
+
+Split into 5a (fixed tone above the game loop, blocking write, no buttons) and 5b
+(non-blocking, button-triggered, cost measured in the frame budget) for the same
+reason Step 4 logged the raw GPIO level before writing any game logic:
+**I2S is write-only, exactly like SPI.** A wrong pin, wrong slot mode, or bad clock
+config all produce the identical symptom — silence, zero error output. Prove the
+transport first and 5b's bugs can only be in 5b.
+
+### The passive buzzer was skipped, deliberately
+
+The plan listed the starter-kit buzzer as a cheaper sanity check. Cut it. A passive
+buzzer exercises **LEDC PWM** — different peripheral, different clock tree, different
+data model (duty cycle vs. sample stream). Nothing it proves carries into I2S and
+nothing it fails would say anything about the amp path. It's a detour producing code
+that gets thrown away.
+
+### Pin selection — the mirror image of Step 4's argument
+
+**BCLK = GPIO42, LRC/WS = GPIO41, DIN = GPIO40.**
+
+Step 4 spent the RTC-capable 4–9 block on buttons specifically to preserve
+`esp_sleep_enable_ext1_wakeup()` for Step 10. I2S has **no wake requirement**, so
+audio should spend the *non-RTC* pins. 39–42 are four consecutive pins on the right
+header; 38 is the onboard WS2812, so take 40/41/42 and leave 39 spare.
+
+Secondary benefit: physically opposite the 40 MHz SPI bundle at the bottom-left. That
+matters more here than it did for buttons — these are real clock lines, not a
+high-impedance pull-up node.
+
+**BCLK runs at 22050 × 16 × 2 = 705.6 kHz.** Two orders of magnitude under the SPI
+clock, so breadboard parasitics are a non-issue for audio. The 80 MHz SPI experiment
+in Open Questions is unaffected by anything on this bus.
+
+### Wiring
+
+| MAX98357A | ESP32-S3 | Note |
+|---|---|---|
+| Vin | **3V3** | not 5V — see below |
+| GND | G | |
+| DIN | 40 | |
+| BCLK | 42 | |
+| LRC | 41 | |
+| GAIN | *floating* | default 9 dB |
+| SD | *floating* | default (L+R)/2 mono |
+| +, − | speaker | bridge-tied load |
+
+**3V3 over 5V.** The DevKitC's 5V pin is raw USB VBUS, shared with the regulator
+feeding the MCU. A 2 W amp's current transients on that rail is a brownout that would
+present as a mysterious reset. At 3.3 V into 8 Ω the output is still ~0.4 W, which is
+loud on a desk. Revisit at Step 10 when the LiPo (3.7 V nominal) makes this a real
+decision.
+
+**`SD` must stay floating, not tied to 3V3.** The board's onboard divider sets
+(L+R)/2 mono by default. Pulling SD above 1.4 V selects **left channel only** — and if
+the data lands in the right slot the result is silence from a correctly wired board.
+Don't spend a pin here.
+
+**Speaker polarity does not matter.** The MAX98357A output is bridge-tied: the amp
+drives both terminals in antiphase and *neither* is ground. Swapping the leads inverts
+the waveform, which is inaudible. Polarity only matters for stereo pairs.
+
+### IDF v6 API
+
+`driver/i2s.h` was **removed** in IDF v6. Any tutorial calling `i2s_driver_install()`
+predates v5 and will not compile. The current path is:
+
+```
+i2s_new_channel()  →  i2s_channel_init_std_mode()  →  i2s_channel_enable()
+                   →  i2s_channel_write()
+```
+
+Header is `driver/i2s_std.h`. `main/CMakeLists.txt` may need `esp_driver_i2s` in
+`REQUIRES`.
+
+**`chan_cfg.auto_clear = true` is not optional.** The default is false, which means an
+underrun replays whatever was last in the DMA buffer — a loud repeating fragment
+rather than silence. With `auto_clear`, an underrun is a gap. It also gives idle
+silence for free: leave the channel enabled permanently and simply don't write when
+nothing is playing, which avoids the enable/disable click entirely.
+
+### Sine, not square, for the first tone
+
+A square wave already sounds buzzy, so it cannot distinguish "correct" from "clipping"
+or "phase discontinuity." A sine's failure modes are each audible and distinct:
+warble → clock config, crackle → underrun or loose speaker lead, harshness → clipping.
+
+5b switches to square, which is what both the CHIP-8 sound timer and the DMG square
+channels actually want.
+
+Amplitude 3200 out of 32767 (~10%) — deliberately low to leave clipping headroom while
+the signal path was unproven.
+
+### Results
+
+```
+I (1588) audio: generated 22050 samples in 404963 us
+I (2538) audio: wrote 44100 bytes in 944114 us (expect ~1000000)
+```
+
+Audible tone, one second, correct duration.
+### Finding 1: `sinf` costs ~18 µs per sample
+
+**404,963 µs to generate 22,050 samples.** On a 160 MHz core with a single-precision
+FPU that is enormous — roughly 2,900 CPU cycles per call. Likely a flash cache miss
+per call, or a fallback to a software double-precision path.
+
+**Consequence: transcendental generation cannot live in a real-time audio loop.**
+Filling even a 512-sample DMA block would cost ~9.2 ms, against an 11.6 ms playback
+window for that block at 22050 Hz — a 79% CPU load to produce a single sine wave.
+
+This is why 5b uses either a precomputed wavetable or integer square waves. It is also
+a preview of the Phase 2 constraint: the DMG APU has four channels, and none of them
+can afford a float per sample.
+
+Worth noting the shape of this: it's the same lesson as Step 3's byte-swap decision.
+Anything per-sample or per-pixel must be a table lookup, not a computation.
+
+### Finding 2: `i2s_channel_write` returns before the audio finishes
+
+944,114 µs against an expected 1,000,000 µs looks like a 5.6% sample-rate error. It
+isn't. **The call blocks until the last sample is handed to the DMA buffers, not until
+it reaches the speaker.** The ~56 ms shortfall *is* the DMA buffer depth still
+draining.
+
+Same distinction as Step 3's `esp_lcd_panel_draw_bitmap`: there are two meaningful
+timestamps, "CPU is free" and "the peripheral is done," and they are not the same
+number. Reading the return as "playback complete" would have led to a phantom
+sample-rate bug.
+
+The genuine sample-rate check is the 440/880 pitch A/B, not this timing.
+
+### Diagnostic split, for later
+
+The `wrote ... us` figure is the fault-isolation instrument for this subsystem: if it
+reports ~1 s, the peripheral and clock ran correctly and any silence is downstream
+(wires, terminal, speaker). If it returns far too fast, the fault is in the config.
+One log line splits the candidate faults into two halves.
+
+---
+
 ## Decisions
 
 **Framebuffer stored pre-byte-swapped.**
@@ -406,6 +554,16 @@ for the Stage B PCB.
 
 **Buttons on RTC-capable GPIOs (4–9).**
 Costs nothing now, preserves deep-sleep wake for Step 10. See Step 4 above.
+
+**Audio on non-RTC GPIOs (40–42).**
+The complement of the button decision. I2S never needs to wake the chip, so it spends
+the pins that can't. Keeps the whole RTC-capable 4–9 block free for the six-button
+expansion. See Step 5a.
+
+**Amp powered from 3V3, not the 5V rail.**
+Avoids putting class-D current transients on the raw VBUS rail shared with the MCU
+regulator. Costs output power (~0.4 W instead of ~1 W) and buys a brownout that never
+happens. Reopen at Step 10 with the LiPo.
 
 **Debounce by sample count, not by elapsed time.**
 Survives frame-rate changes without retuning. Phase 2 will change frame rate.
@@ -443,16 +601,17 @@ back in Phase 2.
   in three hours. A configured GPIO with a known pull-up gives an unambiguous binary
   with no probe geometry, no lead seating, and no dial position to get wrong. For
   anything on a GPIO, the microcontroller is the better instrument; reach for the meter
-  only for nodes the MCU can't see.
+  only for nodes the MCU can't see — the speaker coil and a Vin/GND short being the two
+  real examples so far.
 - **`ESP_LOGI` is a blocking instrument and it sets the resolution floor.** Printing
   inside a sampling loop means the sample period is the UART write time, not the loop
   time. Measured ~82 µs on this build. Suspiciously regular intervals in timing data
   are the tell — mechanical events don't repeat to the microsecond. To resolve finer,
   buffer timestamps in RAM and print after the window closes.
 - **A test that cannot fail is not a test.** Before trusting a passing measurement,
-  break it deliberately — set the debounce window to zero, or sample slower than the
-  event — and confirm the result changes. If it doesn't, the test isn't measuring what
-  it claims to.
+  break it deliberately — set the debounce window to zero, sample slower than the
+  event, or change the tone frequency and check the pitch moves — and confirm the
+  result changes. If it doesn't, the test isn't measuring what it claims to.
 
 ### Wiring
 
@@ -467,12 +626,16 @@ back in Phase 2.
   Cheap partial test with no meter: move the display's LED wire to 3V3. If the
   backlight lights, VCC/GND/panel are confirmed alive — 3 of 9 wires validated,
   and the fault is isolated to the remaining 6.
+- **I2S is write-only too, and fails the same silent way.** A swapped BCLK/LRC, a wrong
+  slot mode, or a floating DIN all give silence with no error. This is why Step 5 was
+  split into transport-first and integration-second.
 - **Charge-only USB cable.** Board powers up with a solid red LED and never enumerates
   in Device Manager — looks like a driver problem, isn't. Known-good data cable is now
   labeled. Also: connect the board directly to the laptop, not through the USB hub.
   If `idf.py flash` reports "the system cannot find the file specified" on COM3, the
   port doesn't exist — the board isn't enumerating. Check the **UART** USB connector,
   not the native USB one.
+
 
 ### Firmware
 
@@ -482,6 +645,15 @@ back in Phase 2.
 - **`ESP_ERROR_CHECK` on every init call.** Any failure panics with file, line, and
   error code. Without it a failed init just returns and you debug a blank screen with
   no information.
+- **`driver/i2s.h` no longer exists in IDF v6.** Use `driver/i2s_std.h` and the
+  channel API. Anything calling `i2s_driver_install()` is pre-v5 and won't compile.
+- **`auto_clear` defaults to false, and false is the wrong answer.** An underrun
+  replays the stale DMA buffer — a loud repeating fragment instead of silence.
+- **`i2s_channel_write` returns when the DMA buffers are fed, not when the sound
+  stops.** Measured a ~56 ms gap on a 1 s tone. Don't read the return as playback
+  completion; it looks exactly like a sample-rate bug.
+- **`sinf` is ~18 µs per call here.** Fine for a one-off table build at init, fatal in
+  a per-sample loop. Precompute.
 - **`idf.py add-dependency` only writes `main/idf_component.yml`.** The component manager
   doesn't fetch until CMake reconfigures, so on an already-built project you get
   "No such file or directory" on the new header. **Always `idf.py fullclean` after
@@ -538,11 +710,17 @@ when a chain of components produces one ambiguous symptom, remove the suspect co
 and test the path around it. Shorting a GPIO straight to ground tests pin + pull-up +
 jumper with the switch out of the circuit entirely — one variable, and it splits the
 candidate faults cleanly. Same shape as moving the display's LED wire to 3V3 to validate
-3 of 9 wires.
+3 of 9 wires, and as reading the `wrote ... us` figure to split I2S faults into
+peripheral-side vs. speaker-side.
 
 **Frame timing is deterministic to the microsecond.** `49999 us` repeated across every
 logged frame, matching the ~0.02% jitter seen in Step 3. Useful property: A/B changes of
 even a few percent are measurable here without averaging.
+
+**Everything per-unit must be a lookup.** Three subsystems have now hit the same wall
+from different directions: the RGB565 byte swap (per pixel), the palette path (per
+pixel), and `sinf` (per sample). The general rule for this platform is that anything
+executing once per pixel or once per sample has to be a table, not a computation.
 
 ---
 
@@ -550,6 +728,7 @@ even a few percent are measurable here without averaging.
 
 - [ ] Try 80 MHz. Bus floor would be 15.4 ms (~65 fps), but that's well past what
       breadboard wiring is likely to hold. Worth finding the ceiling and writing it down.
+      (Audio is unaffected — BCLK is 705.6 kHz, two orders below.)
 - [ ] Double buffering: now argued from two independent measurements (Step 3
       extrapolation, Step 4 render serialization). Predicted gain ~1.20× at 40 MHz.
       Implement and confirm against the prediction.
@@ -561,10 +740,14 @@ even a few percent are measurable here without averaging.
 - [ ] Re-measure bounce on the four additional switches when the six-button set is wired.
       `DEBOUNCE_SAMPLES 2` is sized for unmeasured parts, not for the two characterized
       ones.
-- [ ] Breadboard-friendly tactile switches with straight legs are worth buying. The
-      kit parts have splayed retention legs meant for PCB through-holes and fight the
-      0.1" grid. Micro Center stocks a 6×6 mm assortment; the starter kit only has 4
-      switches and the build needs 6.
+- [ ] Find the usable amplitude range. 3200 (~10% FS) was audible but quiet. Sweep up
+      and find where clipping starts, so 5b has a known ceiling.
+- [ ] Why is `sinf` ~18 µs? Flash cache miss per call, or a software double-precision
+      fallback? Worth ten minutes with a table-based comparison — the answer generalizes
+      to every float in the Phase 2 hot path.
+- [ ] Measure the audio top-up cost per frame in 5b, and decide whether audio belongs on
+      the second core. Step 4's decomposition has room, but the DMA buffer must not
+      underrun while the render pass is serialized.
 
 ---
 
@@ -580,5 +763,17 @@ even a few percent are measurable here without averaging.
   ~82 µs set by the logging instrument. Poll cost 2 µs. Render pass measured at 8.2 ms
   serialized — second independent argument for double buffering. Most of the elapsed
   time went to instrument error, not circuit error — see Gotchas → Instruments.
-- **Step 5 — Audio.** Next: beep on button press over I2S (MAX98357A). Passive buzzer
-  from the starter kit is a cheaper sanity check first.
+- **Step 5a — Audio transport.** ✅ Aug 6 2026. MAX98357A on I2S, BCLK=42 / WS=41 /
+  DIN=40, powered from 3V3, GAIN and SD floating. Header and screw terminal
+  hand-soldered (first solder work on the project). 1 s 440 Hz sine plays; 440→880 A/B
+  confirms requested frequency is delivered frequency, which validates clock, sample
+  rate, slot mode, and wiring as a chain. Two findings: `sinf` costs ~18 µs/sample
+  (405 ms for 22050 samples) so per-sample float generation is off the table, and
+  `i2s_channel_write` returns ~56 ms before the sound stops because it blocks on DMA
+  buffer handoff, not on playback — which looks exactly like a sample-rate bug and
+  isn't. Passive-buzzer sanity check was deliberately skipped: LEDC PWM shares nothing
+  with the I2S path.
+- **Step 5b — Audio integration.** Next: move playback into the frame loop, trigger from
+  `btn_down()`, non-blocking top-up, square wave or wavetable instead of `sinf`. Measure
+  the per-frame cost alongside `input` / `render` / `cpu` and confirm it fits the budget
+  Step 3 bought.

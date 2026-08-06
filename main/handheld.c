@@ -3,6 +3,7 @@
 #include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_ili9341.h"
@@ -12,6 +13,8 @@
 #include "esp_heap_caps.h"
 #include <assert.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <math.h>
 
 #define PIN_SCK   12
 #define PIN_MOSI  11
@@ -23,6 +26,17 @@
 
 #define LCD_W 240
 #define LCD_H 320
+
+// ---------------------------------------------------------------- audio
+
+#define PIN_I2S_BCLK  GPIO_NUM_42
+#define PIN_I2S_WS    GPIO_NUM_41
+#define PIN_I2S_DOUT  GPIO_NUM_40
+
+#define SAMPLE_RATE   22050
+#define TONE_HZ       880
+#define TONE_AMP      3200        // ~10% of full scale; leaves clipping headroom
+#define TONE_SAMPLES  SAMPLE_RATE // 1 second
 
 // ---------------------------------------------------------------- buttons
 
@@ -188,6 +202,68 @@ void app_main(void)
     }
     */
     ESP_LOGI("bounce", "window closed");
+
+    // ------------------------------------------------------------ 5a: audio
+    // Temporary bring-up block. Proves the whole chain -- I2S peripheral,
+    // three wires, MAX98357A, speaker -- before any game logic can be a
+    // suspect. I2S is write-only like SPI: a wrong pin, wrong slot mode, or
+    // bad clock config all produce identical silence with zero error output.
+    // Must live ABOVE the game loop; code after while(1) is unreachable and
+    // produces no warning.
+    {
+        i2s_chan_handle_t tx = NULL;
+
+        i2s_chan_config_t chan_cfg =
+            I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+        // Underrun replays the stale DMA buffer otherwise -- a loud repeating
+        // fragment instead of silence.
+        chan_cfg.auto_clear = true;
+        ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx, NULL));
+
+        i2s_std_config_t std_cfg = {
+            .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                            I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = PIN_I2S_BCLK,
+                .ws   = PIN_I2S_WS,
+                .dout = PIN_I2S_DOUT,
+                .din  = I2S_GPIO_UNUSED,
+                .invert_flags = { false, false, false },
+            },
+        };
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx, &std_cfg));
+        ESP_ERROR_CHECK(i2s_channel_enable(tx));
+
+        int16_t *tone = malloc(TONE_SAMPLES * sizeof(int16_t));
+        ESP_ERROR_CHECK(tone ? ESP_OK : ESP_ERR_NO_MEM);
+
+        // Sine, not square: a square already sounds buzzy, so it can't
+        // distinguish "correct" from "clipping". Sine's failure modes are
+        // audible -- warble is clock config, crackle is underrun or a loose
+        // speaker wire, harshness is clipping. 5b switches to square, which
+        // is what the CHIP-8 sound timer and DMG channels actually want.
+        int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < TONE_SAMPLES; i++) {
+            tone[i] = (int16_t)(TONE_AMP *
+                       sinf(2.0f * (float)M_PI * TONE_HZ * i / SAMPLE_RATE));
+        }
+        ESP_LOGI("audio", "generated %d samples in %lld us",
+                 TONE_SAMPLES, esp_timer_get_time() - t0);
+
+        size_t written = 0;
+        t0 = esp_timer_get_time();
+        ESP_ERROR_CHECK(i2s_channel_write(tx, tone,
+                                          TONE_SAMPLES * sizeof(int16_t),
+                                          &written, portMAX_DELAY));
+        ESP_LOGI("audio", "wrote %u bytes in %lld us (expect ~1000000)",
+                 (unsigned)written, esp_timer_get_time() - t0);
+
+        free(tone);
+        ESP_ERROR_CHECK(i2s_channel_disable(tx));
+        ESP_ERROR_CHECK(i2s_del_channel(tx));
+    }
 
     int sq_x = (LCD_W - SQ_SIZE) / 2;
     int sq_y = (LCD_H - SQ_SIZE) / 2;
