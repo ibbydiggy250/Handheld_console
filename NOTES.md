@@ -797,4 +797,18 @@ executing once per pixel or once per sample has to be a table, not a computation
   a test that cannot fail — so `FRAME_US` was set to 60000, `frame` snapped to
   ~60000 while `work` held ~50 ms, confirming the deadline/sleep path actually
   paces. Four buttons now live (GPIO 4–7); beep fires on the press edge of any.
+  - **Step 9 — Snake.** ✅ Aug 6 2026. First real game on the platform, dropped into the
+  Step 8 seam exactly as designed: `game_state_t`, `update()`, and `render()` replaced;
+  frame clock, input, audio, and DMA push untouched. New patterns Snake forced that the
+  moving-square demo didn't have: a **move-tick gate** (input polled every frame for
+  responsiveness, snake advances every `MOVE_EVERY = 4` frames — 5 moves/sec — since
+  20 fps movement is unplayable), a **direction latch** (`next_dir` written by input,
+  consumed at the move-tick, 180° reversal rejected against the *consumed* direction),
+  and a **circular-buffer body** (head index + length over fixed arrays; grow = don't
+  retire the tail that tick, O(1) per move, no shifting). Food placement rejects
+  occupied cells; death on wall or self, long beep via a new `audio_beep_ms()`, red
+  full-screen flash, any-button restart off the same edge detection — so the press
+  that killed you can't also restart you. Game logic cost is noise in the frame
+  budget; render writes the same 153,600 B as before. Platform claim proven: input,
+  update, render, and audio compose into a playable game under the fixed frame clock.
 

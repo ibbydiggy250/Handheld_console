@@ -95,6 +95,10 @@ static void audio_beep(void)
 {
     beep_remaining = SAMPLE_RATE * BEEP_MS / 1000;
 }
+static void audio_beep_ms(int ms)
+{
+    beep_remaining = SAMPLE_RATE * ms / 1000;
+}
 
 // Called once per frame, non-blocking. Generates up to a chunk of square wave
 // and hands it to the DMA buffer. Returns bytes the buffer actually accepted --
@@ -225,8 +229,8 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
 
 #define SQ_SIZE   32
 #define SQ_SPEED  4        // pixels per frame while held
-
-// ---------------------------------------------------------------- game
+/*
+// ----------------------------------------------------------------   basic
 
 // update() touches ONLY this struct; render() reads it. This seam is the
 // Phase 1 body / brain split: in Step 11 the CHIP-8 core replaces update()
@@ -269,7 +273,137 @@ static void render(const game_state_t *g, uint16_t *fb)
         }
     }
 }
+*/
+// ---------------------------------------------------------------- snake game
 
+#define COLOR_SNAKE  0xE007   // green, pre-swapped
+#define COLOR_FOOD   0x00F8   // red, pre-swapped
+// 16 px cells: 240/16 = 15 wide, 320/16 = 20 tall. Clean divisors.
+#define CELL       16
+#define GRID_W     (LCD_W / CELL)    // 15
+#define GRID_H     (LCD_H / CELL)    // 20
+#define GRID_CELLS (GRID_W * GRID_H) // 300 = max snake length
+
+#define MOVE_EVERY 4                 // move-tick every 4 frames = 5 moves/sec
+#define START_LEN  3
+
+typedef enum { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT } dir_t;
+
+// Body is a circular buffer of cell coords. head_i is the newest segment;
+// tail is (head_i - len + 1) mod GRID_CELLS. Advancing = write new head,
+// grow = don't retire the tail that tick. No shifting, O(1) per move.
+typedef struct {
+    uint8_t x[GRID_CELLS], y[GRID_CELLS];
+    int     head_i;
+    int     len;
+    dir_t   dir;        // direction consumed at the move-tick
+    dir_t   next_dir;   // latched from input every frame
+    int     food_x, food_y;
+    int     tick;       // frames since last move
+    bool    dead;
+} game_state_t;
+
+static bool snake_occupies(const game_state_t *g, int x, int y)
+{
+    for (int i = 0; i < g->len; i++) {
+        int idx = (g->head_i - i + GRID_CELLS) % GRID_CELLS;
+        if (g->x[idx] == x && g->y[idx] == y) return true;
+    }
+    return false;
+}
+
+static void place_food(game_state_t *g)
+{
+    do {
+        g->food_x = rand() % GRID_W;
+        g->food_y = rand() % GRID_H;
+    } while (snake_occupies(g, g->food_x, g->food_y));
+}
+
+static void game_reset(game_state_t *g)
+{
+    g->len    = START_LEN;
+    g->head_i = START_LEN - 1;
+    for (int i = 0; i < START_LEN; i++) {           // horizontal, head rightmost
+        g->x[i] = GRID_W / 2 - (START_LEN - 1) + i;
+        g->y[i] = GRID_H / 2;
+    }
+    g->dir = g->next_dir = DIR_RIGHT;
+    g->tick = 0;
+    g->dead = false;
+    place_food(g);
+}
+
+static void update(game_state_t *g)
+{
+    // Latch direction every frame (responsive), reject 180-degree reversal.
+    if (btn_went_down(BTN_UP)    && g->dir != DIR_DOWN)  g->next_dir = DIR_UP;
+    if (btn_went_down(BTN_DOWN)  && g->dir != DIR_UP)    g->next_dir = DIR_DOWN;
+    if (btn_went_down(BTN_LEFT)  && g->dir != DIR_RIGHT) g->next_dir = DIR_LEFT;
+    if (btn_went_down(BTN_RIGHT) && g->dir != DIR_LEFT)  g->next_dir = DIR_RIGHT;
+
+    if (g->dead) {
+        // Any press restarts.
+        for (int i = 0; i < BTN_COUNT; i++)
+            if (btn_went_down(i)) { game_reset(g); return; }
+        return;
+    }
+
+    if (++g->tick < MOVE_EVERY) return;   // not a move-tick
+    g->tick = 0;
+
+    g->dir = g->next_dir;
+    int hx = g->x[g->head_i], hy = g->y[g->head_i];
+    switch (g->dir) {
+        case DIR_UP:    hy--; break;
+        case DIR_DOWN:  hy++; break;
+        case DIR_LEFT:  hx--; break;
+        case DIR_RIGHT: hx++; break;
+    }
+
+    // Wall or self = death. Self-check runs BEFORE writing the new head; tail
+    // cell is still counted, which is the conservative (classic) rule.
+    if (hx < 0 || hx >= GRID_W || hy < 0 || hy >= GRID_H ||
+        snake_occupies(g, hx, hy)) {
+        g->dead = true;
+        audio_beep_ms(400);
+        return;
+    }
+
+    bool ate = (hx == g->food_x && hy == g->food_y);
+
+    g->head_i = (g->head_i + 1) % GRID_CELLS;
+    g->x[g->head_i] = hx;
+    g->y[g->head_i] = hy;
+
+    if (ate) {
+        g->len++;               // keep tail this tick = grow
+        audio_beep();
+        if (g->len < GRID_CELLS) place_food(g);
+    }
+    // Not ate: len unchanged, tail retires implicitly via the modular window.
+}
+
+static void fill_cell(uint16_t *fb, int cx, int cy, uint16_t color)
+{
+    for (int y = cy * CELL; y < (cy + 1) * CELL; y++) {
+        uint16_t *row = fb + y * LCD_W;
+        for (int x = cx * CELL; x < (cx + 1) * CELL; x++) row[x] = color;
+    }
+}
+
+static void render(const game_state_t *g, uint16_t *fb)
+{
+    // Dead = red flash background so the state is unmissable.
+    uint16_t bg = g->dead ? COLOR_FOOD : COLOR_BG;
+    for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = bg;
+
+    fill_cell(fb, g->food_x, g->food_y, COLOR_FOOD);
+    for (int i = 0; i < g->len; i++) {
+        int idx = (g->head_i - i + GRID_CELLS) % GRID_CELLS;
+        fill_cell(fb, g->x[idx], g->y[idx], COLOR_SNAKE);
+    }
+}
 // ---------------------------------------------------------------- main
 
 void app_main(void)
@@ -339,10 +473,9 @@ void app_main(void)
     // 6. Audio -- channel created once, enabled for the whole program.
     audio_init();
 
-    game_state_t game = {
-        .sq_x = (LCD_W - SQ_SIZE) / 2,
-        .sq_y = (LCD_H - SQ_SIZE) / 2,
-    };
+    srand((unsigned)esp_timer_get_time());
+    game_state_t game;
+    game_reset(&game);
     int frame = 0;
 
     // Absolute deadline for the fixed frame clock. Advancing by += FRAME_US
