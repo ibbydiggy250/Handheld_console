@@ -26,6 +26,11 @@
 #define LCD_W 240
 #define LCD_H 320
 
+// Fixed frame clock. 50 ms = 20 fps -- known to fit from Step 4's measured
+// worst case (~50.0 ms wall). The deadline is absolute, so the frame rate is
+// now a decision, not whatever DMA completion happens to dictate.
+#define FRAME_US  50000
+
 // ---------------------------------------------------------------- audio
 
 #define PIN_I2S_BCLK  GPIO_NUM_42
@@ -131,8 +136,8 @@ static size_t audio_feed(void)
 
 #define BTN_LEFT   0
 #define BTN_RIGHT  1
-#define BTN_UP 2
-#define BTN_DOWN 3
+#define BTN_UP     2
+#define BTN_DOWN   3
 #define BTN_COUNT  4
 
 static const int btn_gpios[BTN_COUNT] = { 4, 5, 6, 7 };
@@ -221,6 +226,50 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
 #define SQ_SIZE   32
 #define SQ_SPEED  4        // pixels per frame while held
 
+// ---------------------------------------------------------------- game
+
+// update() touches ONLY this struct; render() reads it. This seam is the
+// Phase 1 body / brain split: in Step 11 the CHIP-8 core replaces update()
+// and nothing else changes.
+typedef struct {
+    int sq_x, sq_y;
+} game_state_t;
+
+// Pure logic: state + input -> new state. No hardware calls, no drawing.
+static void update(game_state_t *g)
+{
+    // Beep on the press EDGE, not the level -- holding a button would
+    // otherwise re-arm the tone every frame and it would stutter.
+    if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT) ||
+        btn_went_down(BTN_UP)   || btn_went_down(BTN_DOWN)) {
+        audio_beep();
+    }
+
+    if (btn_down(BTN_LEFT))  g->sq_x -= SQ_SPEED;
+    if (btn_down(BTN_RIGHT)) g->sq_x += SQ_SPEED;
+    if (btn_down(BTN_UP))    g->sq_y -= SQ_SPEED;
+    if (btn_down(BTN_DOWN))  g->sq_y += SQ_SPEED;
+
+    if (g->sq_x < 0)               g->sq_x = 0;
+    if (g->sq_x > LCD_W - SQ_SIZE) g->sq_x = LCD_W - SQ_SIZE;
+    if (g->sq_y < 0)               g->sq_y = 0;
+    if (g->sq_y > LCD_H - SQ_SIZE) g->sq_y = LCD_H - SQ_SIZE;
+}
+
+// State -> framebuffer. Nothing here mutates game state.
+static void render(const game_state_t *g, uint16_t *fb)
+{
+    for (int i = 0; i < LCD_W * LCD_H; i++) {
+        fb[i] = COLOR_BG;
+    }
+    for (int y = g->sq_y; y < g->sq_y + SQ_SIZE; y++) {
+        uint16_t *row = fb + y * LCD_W;
+        for (int x = g->sq_x; x < g->sq_x + SQ_SIZE; x++) {
+            row[x] = COLOR_SQ;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- main
 
 void app_main(void)
@@ -290,45 +339,36 @@ void app_main(void)
     // 6. Audio -- channel created once, enabled for the whole program.
     audio_init();
 
-    int sq_x = (LCD_W - SQ_SIZE) / 2;
-    int sq_y = (LCD_H - SQ_SIZE) / 2;
+    game_state_t game = {
+        .sq_x = (LCD_W - SQ_SIZE) / 2,
+        .sq_y = (LCD_H - SQ_SIZE) / 2,
+    };
     int frame = 0;
+
+    // Absolute deadline for the fixed frame clock. Advancing by += FRAME_US
+    // (never "now + FRAME_US") means a long frame is followed by a short one
+    // and the average rate holds -- no drift accumulation.
+    int64_t next_frame = esp_timer_get_time();
 
     // ------------------------------------------------------------ game loop
     while (1) {
+        next_frame += FRAME_US;
         int64_t t0 = esp_timer_get_time();
 
         // --- input
         buttons_poll();
-        // Beep on the press EDGE, not the level -- holding a button would
-        // otherwise re-arm the tone every frame and it would stutter.
-        if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT)) {
-            audio_beep();
-        }
-        if (btn_down(BTN_LEFT))  sq_x -= SQ_SPEED;
-        if (btn_down(BTN_RIGHT)) sq_x += SQ_SPEED;
-
-        if (sq_x < 0)                 sq_x = 0;
-        if (sq_x > LCD_W - SQ_SIZE)   sq_x = LCD_W - SQ_SIZE;
-
         int64_t t_input = esp_timer_get_time();
+
+        // --- update: pure logic against the state struct
+        update(&game);
 
         // --- audio top-up. Non-blocking; feeds the DMA buffer whatever the
         // current beep needs, then returns. audio_bytes is the underrun gauge.
         size_t audio_bytes = audio_feed();
         int64_t t_audio = esp_timer_get_time();
 
-        // --- render into the framebuffer
-        for (int i = 0; i < LCD_W * LCD_H; i++) {
-            fb[i] = COLOR_BG;
-        }
-        for (int y = sq_y; y < sq_y + SQ_SIZE; y++) {
-            uint16_t *row = fb + y * LCD_W;
-            for (int x = sq_x; x < sq_x + SQ_SIZE; x++) {
-                row[x] = COLOR_SQ;
-            }
-        }
-
+        // --- render state into the framebuffer
+        render(&game, fb);
         int64_t t_render = esp_timer_get_time();
 
         // --- push. Queues the DMA transfer and returns; does not block.
@@ -342,14 +382,27 @@ void app_main(void)
         xSemaphoreTake(trans_done_sem, portMAX_DELAY);
         int64_t t_done = esp_timer_get_time();
 
+        // --- frame clock: sleep off whatever budget remains
+        int64_t now = esp_timer_get_time();
+        if (next_frame > now) {
+            // Slack exists: yield until the deadline. vTaskDelay granularity
+            // is 10 ms ticks -- coarse, but fine at a 50 ms frame. Revisit if
+            // the budget ever tightens.
+            vTaskDelay(pdMS_TO_TICKS((next_frame - now) / 1000));
+        } else {
+            // Overran the budget: resync rather than bursting to catch up.
+            next_frame = now;
+        }
+
         if (++frame % 30 == 0) {
             ESP_LOGI("perf",
-                     "input %lld | audio %lld (%u B) | render %lld | cpu %lld | frame %lld us",
+                     "input %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us",
                      t_input  - t0,
                      t_audio  - t_input, (unsigned)audio_bytes,
                      t_render - t_audio,
                      t_cpu    - t0,
-                     t_done   - t0);
+                     t_done   - t0,
+                     esp_timer_get_time() - t0);
         }
     }
 }

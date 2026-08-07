@@ -783,4 +783,18 @@ executing once per pixel or once per sample has to be a table, not a computation
   rapid presses. Second-core audio task (Step 7) left unbuilt — no measurement justifies
   it. **Phase 1 Stage A core subsystems (display, framebuffer/DMA, input, audio) are now
   all proven.**
+  - **Step 8 — Game loop.** ✅ Aug 6 2026. Fixed-timestep frame clock with a clean
+  input → update → render split. `FRAME_US 50000` (20 fps), sized to the measured
+  worst case from Step 4. Deadline is **absolute** (`next_frame += FRAME_US`, never
+  `now +`), so a long frame is followed by a short one and the average rate holds
+  with no drift; on overrun the deadline resyncs to `now` instead of bursting to
+  catch up. Game logic moved into `update()` against a `game_state_t` struct —
+  no hardware calls, no drawing — with `render()` reading state into the
+  framebuffer. That seam is the Step 11 socket: the CHIP-8 core replaces
+  `update()` and nothing else. Perf line now splits `work` (loop body through DMA
+  completion) from `frame` (total including slack sleep). Validated by A/B: at
+  50000 the clock is unobservable because DMA already paces the loop at ~50 ms —
+  a test that cannot fail — so `FRAME_US` was set to 60000, `frame` snapped to
+  ~60000 while `work` held ~50 ms, confirming the deadline/sleep path actually
+  paces. Four buttons now live (GPIO 4–7); beep fires on the press edge of any.
 
