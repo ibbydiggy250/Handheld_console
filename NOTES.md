@@ -576,43 +576,6 @@ back in Phase 2.
 
 ## Gotchas (learned the hard way)
 
-### Instruments
-
-- **A multimeter probe cannot reach a breadboard clip.** The spring contact sits several
-  mm below the surface and the hole is sized for a ~0.6 mm pin; a ~2 mm probe cone wedges
-  in the plastic funnel and stops short. **Bare holes always read open, regardless of
-  what's plugged in.** Seat a jumper and probe its exposed end instead. This produced a
-  false "the legs aren't seated" diagnosis that survived hours of debugging.
-- **Calibrate the meter before trusting a number.** Touch the probe tips together and
-  read the value — that's lead resistance and the floor. Measured **004** here, so
-  anything reading below 004 is noise, not a better connection. On this meter (ANENG
-  DM850) an open circuit displays a bare **`1`** on the left of the screen, not `OL`.
-- **Both probes on the same wire measures the wire, not the circuit.** Beeping proves
-  the jumper is continuous end to end. To test whether two nodes are connected, each
-  probe must be on a *different* conductor with the component between them.
-- **Banana plugs work loose.** A marginal lead reads as a dead short from anything to
-  anything, and it comes and goes as the leads move. Push both plugs fully home, then
-  re-baseline: probes apart must be silent, probes together must beep. If it beeps in
-  open air, stop — nothing downstream means anything.
-- **Probe geometry matters.** Holding both probes in one hand with the tips converging
-  lets them touch each other. One probe per hand, approaching from opposite directions,
-  tips well apart.
-- **Flash before you meter.** The MCU settled in thirty seconds what the meter couldn't
-  in three hours. A configured GPIO with a known pull-up gives an unambiguous binary
-  with no probe geometry, no lead seating, and no dial position to get wrong. For
-  anything on a GPIO, the microcontroller is the better instrument; reach for the meter
-  only for nodes the MCU can't see — the speaker coil and a Vin/GND short being the two
-  real examples so far.
-- **`ESP_LOGI` is a blocking instrument and it sets the resolution floor.** Printing
-  inside a sampling loop means the sample period is the UART write time, not the loop
-  time. Measured ~82 µs on this build. Suspiciously regular intervals in timing data
-  are the tell — mechanical events don't repeat to the microsecond. To resolve finer,
-  buffer timestamps in RAM and print after the window closes.
-- **A test that cannot fail is not a test.** Before trusting a passing measurement,
-  break it deliberately — set the debounce window to zero, sample slower than the
-  event, or change the tone frequency and check the pitch moves — and confirm the
-  result changes. If it doesn't, the test isn't measuring what it claims to.
-
 ### Wiring
 
 - **Read the silkscreen label, don't count header positions.** The DevKitC-1's left edge
