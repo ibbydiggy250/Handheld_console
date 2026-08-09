@@ -23,8 +23,23 @@
 #define PIN_RST   15
 #define PIN_BL    16
 
-#define LCD_W 240
-#define LCD_H 320
+// LANDSCAPE. The panel is natively 240x320 portrait; swap_xy + mirror below
+// rotate it 90 degrees, so the framebuffer is addressed 320 wide x 240 tall.
+// Byte count is identical (153600) -- this is a reinterpretation of the same
+// buffer, not a reallocation.
+//
+// The reason for landscape: CHIP-8 is a 64x32 (2:1) frame. Portrait allows
+// only 3x integer scale (192x96, 24% of the panel used). Landscape allows 5x
+// (320x160, full width, bars top and bottom only).
+#define LCD_W 320
+#define LCD_H 240
+
+// Which mirror pairs with swap_xy to give the correct rotation depends on the
+// panel's native scan direction and is not derivable -- it's a two-option A/B.
+// If the image comes out rotated 180 degrees (snake travels away from the
+// RIGHT button), flip these two.
+#define LCD_MIRROR_X  true
+#define LCD_MIRROR_Y  false
 
 // Fixed frame clock. 50 ms = 20 fps -- known to fit from Step 4's measured
 // worst case (~50.0 ms wall). The deadline is absolute, so the frame rate is
@@ -227,61 +242,23 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
 #define COLOR_BG  0x1F00   // blue
 #define COLOR_SQ  0xFFFF   // white (swap-invariant)
 
-#define SQ_SIZE   32
-#define SQ_SPEED  4        // pixels per frame while held
-/*
-// ----------------------------------------------------------------   basic
-
-// update() touches ONLY this struct; render() reads it. This seam is the
-// Phase 1 body / brain split: in Step 11 the CHIP-8 core replaces update()
-// and nothing else changes.
-typedef struct {
-    int sq_x, sq_y;
-} game_state_t;
-
-// Pure logic: state + input -> new state. No hardware calls, no drawing.
-static void update(game_state_t *g)
-{
-    // Beep on the press EDGE, not the level -- holding a button would
-    // otherwise re-arm the tone every frame and it would stutter.
-    if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT) ||
-        btn_went_down(BTN_UP)   || btn_went_down(BTN_DOWN)) {
-        audio_beep();
-    }
-
-    if (btn_down(BTN_LEFT))  g->sq_x -= SQ_SPEED;
-    if (btn_down(BTN_RIGHT)) g->sq_x += SQ_SPEED;
-    if (btn_down(BTN_UP))    g->sq_y -= SQ_SPEED;
-    if (btn_down(BTN_DOWN))  g->sq_y += SQ_SPEED;
-
-    if (g->sq_x < 0)               g->sq_x = 0;
-    if (g->sq_x > LCD_W - SQ_SIZE) g->sq_x = LCD_W - SQ_SIZE;
-    if (g->sq_y < 0)               g->sq_y = 0;
-    if (g->sq_y > LCD_H - SQ_SIZE) g->sq_y = LCD_H - SQ_SIZE;
-}
-
-// State -> framebuffer. Nothing here mutates game state.
-static void render(const game_state_t *g, uint16_t *fb)
-{
-    for (int i = 0; i < LCD_W * LCD_H; i++) {
-        fb[i] = COLOR_BG;
-    }
-    for (int y = g->sq_y; y < g->sq_y + SQ_SIZE; y++) {
-        uint16_t *row = fb + y * LCD_W;
-        for (int x = g->sq_x; x < g->sq_x + SQ_SIZE; x++) {
-            row[x] = COLOR_SQ;
-        }
-    }
-}
-*/
 // ---------------------------------------------------------------- snake game
+//
+// TEMPORARY. Snake is retained for exactly one flash, as the orientation
+// reference: it is a display path already known good, so if the screen looks
+// wrong here the fault is the rotation and nothing else. Step 11d deletes this
+// whole section -- the CHIP-8 core replaces update()/render().
 
 #define COLOR_SNAKE  0xE007   // green, pre-swapped
 #define COLOR_FOOD   0x00F8   // red, pre-swapped
-// 16 px cells: 240/16 = 15 wide, 320/16 = 20 tall. Clean divisors.
+
+// 16 px cells. In landscape: 320/16 = 20 wide, 240/16 = 15 tall. Both still
+// clean divisors, and the cell COUNT is unchanged at 300 -- the grid is the
+// same 300 cells rotated, so nothing about the game logic or the circular
+// buffer sizing moves. Derived from LCD_W/LCD_H, which is why this was free.
 #define CELL       16
-#define GRID_W     (LCD_W / CELL)    // 15
-#define GRID_H     (LCD_H / CELL)    // 20
+#define GRID_W     (LCD_W / CELL)    // 20
+#define GRID_H     (LCD_H / CELL)    // 15
 #define GRID_CELLS (GRID_W * GRID_H) // 300 = max snake length
 
 #define MOVE_EVERY 4                 // move-tick every 4 frames = 5 moves/sec
@@ -404,6 +381,7 @@ static void render(const game_state_t *g, uint16_t *fb)
         fill_cell(fb, g->x[idx], g->y[idx], COLOR_SNAKE);
     }
 }
+
 // ---------------------------------------------------------------- main
 
 void app_main(void)
@@ -459,13 +437,22 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+
+    // Rotate to landscape. MUST come AFTER esp_lcd_panel_init() -- init runs
+    // the datasheet startup sequence, which includes writing memory access
+    // mode (MADCTL). These two calls rewrite that same register, so calling
+    // them first would just get overwritten.
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, LCD_MIRROR_X, LCD_MIRROR_Y));
+
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
     // 4. Framebuffer in PSRAM, 64-byte aligned for clean DMA cache writeback
-    size_t fb_size = LCD_W * LCD_H * sizeof(uint16_t);   // 153600
+    size_t fb_size = LCD_W * LCD_H * sizeof(uint16_t);   // 153600, unchanged
     uint16_t *fb = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
     assert(fb != NULL);
-    ESP_LOGI("fb", "framebuffer at %p, %u bytes", fb, (unsigned)fb_size);
+    ESP_LOGI("fb", "framebuffer at %p, %u bytes, %dx%d",
+             fb, (unsigned)fb_size, LCD_W, LCD_H);
 
     // 5. Input
     buttons_init();
