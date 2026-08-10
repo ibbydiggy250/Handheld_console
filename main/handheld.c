@@ -18,6 +18,7 @@
 
 #include "chip8.h"
 #include "rom_pong.h"
+#include "rom_tetris.h"
 
 #define PIN_SCK   12
 #define PIN_MOSI  11
@@ -35,54 +36,181 @@
 #define LCD_MIRROR_X  false
 #define LCD_MIRROR_Y  false
 
-// Fixed frame clock. 50 ms = 20 fps -- Step 4's measured worst case.
-#define FRAME_US 41000
+// 41 ms. Measured floor at 40 MHz SPI: work lands at ~39990 us, of which
+// 30720 us is the irreducible payload time for 153600 bytes. Going lower
+// means overrunning every frame. Raising the rate from 20 to 24.4 fps is
+// what actually fixed the CHIP-8 XOR flicker -- narrowing the sampling gap
+// beat masking it with a longer persistence decay.
+#define FRAME_US  41000
+
 // ---------------------------------------------------------------- chip-8
 
-// Emulated rates, stated as RATES rather than per-frame counts so they stay
-// correct if FRAME_US changes (double buffering will change it). The laptop
-// frontend uses these same two constants against a 60 fps frame period and
-// derives different counts from them -- that's the point of the form.
+// Emulated rates, stated as RATES so they stay correct when FRAME_US moves.
+// This is the form that made the 50000 -> 41000 change free.
 //
-//   CHIP8_HZ 600 matches the laptop build (10 cycles @ 60 fps). It is not a
-//   spec value -- CHIP-8 has no defined clock -- but it is the speed Pong and
-//   Tetris were played at during Phase 0, so it's the known-good reference.
+// NOTE: at 41000, TIMER_TICKS_PER_FRAME truncates to 2, so the delay/sound
+// timers run at 48 Hz rather than the spec's 60 Hz -- every timed effect is
+// ~20% slow. Invisible in Pong. Fix if it ever matters is an accumulator
+// rather than a fixed count.
 #define CHIP8_HZ  600
 #define TIMER_HZ  60
 
-#define CYCLES_PER_FRAME       ((CHIP8_HZ * FRAME_US) / 1000000)  // 30
-#define TIMER_TICKS_PER_FRAME  ((TIMER_HZ * FRAME_US) / 1000000)  // 3
+#define CYCLES_PER_FRAME       ((CHIP8_HZ * FRAME_US) / 1000000)  // 24
+#define TIMER_TICKS_PER_FRAME  ((TIMER_HZ * FRAME_US) / 1000000)  // 2
 
 // 5x integer scale: 64*5 = 320 (full panel width), 32*5 = 160.
-// 240 - 160 = 80 rows of letterbox, 40 top and 40 bottom.
 #define SCALE     5
 #define IMG_W     (CHIP8_DISPLAY_W * SCALE)   // 320
 #define IMG_H     (CHIP8_DISPLAY_H * SCALE)   // 160
 #define IMG_X0    ((LCD_W - IMG_W) / 2)       // 0
 #define IMG_Y0    ((LCD_H - IMG_H) / 2)       // 40
 
-// CHIP-8 is monochrome. Both of these are byte-swap invariant, so the
-// pre-swapped framebuffer convention costs nothing here.
 #define COLOR_FG      0xFFFF   // white
 #define COLOR_BG      0x0000   // black
 #define COLOR_LETTER  0x0000   // letterbox bars
+#define COLOR_SEL     0x1F00   // blue, pre-byte-swapped -- menu highlight
+#define COLOR_DIM     0x1084   // grey, pre-byte-swapped -- unselected text
 
-// ~6.2 KB. Static, so it lands in internal RAM (.bss) rather than the stack
-// or PSRAM -- mem[] is touched twice per cycle and PSRAM cache misses would
-// show up directly in the per-frame cost.
+// ~6.2 KB. Static so it lands in internal RAM (.bss) rather than PSRAM --
+// mem[] is touched twice per cycle and cache misses would show up per-frame.
 static Chip8 chip;
 
-// Which CHIP-8 hex key each physical button presses.
-//
-// Classic PONG.ch8 uses 1/4 for the left paddle and C/D for the right. This
-// mapping is a convention of the ROM, not of CHIP-8 -- every ROM picks its
-// own keys. If a button does nothing, this table is the only thing to edit.
-static const uint8_t btn_to_key[] = {
-    0xC,   // BTN_LEFT  -> right paddle up
-    0xD,   // BTN_RIGHT -> right paddle down
-    0x1,   // BTN_UP    -> left paddle up
-    0x4,   // BTN_DOWN  -> left paddle down
+// ---------------------------------------------------------------- rom table
+
+// Each ROM carries its own keypad mapping, because CHIP-8 defines no
+// convention -- every ROM picks whichever hex keys it likes. Pong uses 1/4
+// and C/D; Tetris uses a different set entirely. Bundling the mapping with
+// the ROM is what makes adding a third ROM a one-line change.
+typedef struct {
+    const char          *name;
+    const unsigned char *data;
+    unsigned             len;
+    uint8_t              keys[4];   // indexed by button index 0..3
+} rom_t;
+
+static const rom_t roms[] = {
+    // PONG: 1/4 drive the left paddle, C/D the right.
+    { "PONG",   pong_ch8,   pong_ch8_len,   { 0xC, 0xD, 0x1, 0x4 } },
+
+    // TETRIS: commonly documented as 4=rotate, 5=left, 6=right, 7=drop.
+    // UNVERIFIED on this specific ROM -- if a button does nothing, this row
+    // is the only thing to edit.
+    { "TETRIS", tetris_ch8, tetris_ch8_len, { 0x5, 0x6, 0x4, 0x7 } },
 };
+
+#define ROM_COUNT (int)(sizeof(roms) / sizeof(roms[0]))
+
+static const rom_t *active_rom = NULL;
+
+// ---------------------------------------------------------------- font
+//
+// 5x7 uppercase bitmap font. Each glyph is 7 bytes, one per row, low 5 bits
+// used, bit 4 = leftmost pixel. Hand-built because pulling in a font library
+// for 40 glyphs would cost more than it saves -- and this is the same
+// "everything per-pixel is a table" rule the byte-swap and palette paths hit.
+
+#define GLYPH_W 5
+#define GLYPH_H 7
+
+static const uint8_t font5x7[][GLYPH_H] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, //  0 space
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, //  1 -
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x04}, //  2 .
+    {0x08,0x04,0x02,0x01,0x02,0x04,0x08}, //  3 > (cursor)
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, //  4 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, //  5 1
+    {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}, //  6 2
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, //  7 3
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, //  8 4
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, //  9 5
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, // 10 6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, // 11 7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 12 8
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 13 9
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, // 14 A
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // 15 B
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // 16 C
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, // 17 D
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, // 18 E
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, // 19 F
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, // 20 G
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, // 21 H
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, // 22 I
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}, // 23 J
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, // 24 K
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, // 25 L
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, // 26 M
+    {0x11,0x11,0x19,0x15,0x13,0x11,0x11}, // 27 N
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, // 28 O
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, // 29 P
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, // 30 Q
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, // 31 R
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, // 32 S
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, // 33 T
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, // 34 U
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, // 35 V
+    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}, // 36 W
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // 37 X
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, // 38 Y
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, // 39 Z
+};
+
+static int glyph_index(char ch)
+{
+    if (ch >= 'a' && ch <= 'z') ch -= 32;          // fold to uppercase
+    if (ch >= '0' && ch <= '9') return  4 + (ch - '0');
+    if (ch >= 'A' && ch <= 'Z') return 14 + (ch - 'A');
+    switch (ch) {
+        case '-': return 1;
+        case '.': return 2;
+        case '>': return 3;
+        default:  return 0;                        // space / unknown
+    }
+}
+
+// Draw one glyph at (x,y), each source pixel expanded to sc x sc.
+// Clipped against the framebuffer so a long string can't scribble off-screen.
+static void draw_glyph(uint16_t *fb, int x, int y, char ch, int sc, uint16_t col)
+{
+    const uint8_t *g = font5x7[glyph_index(ch)];
+
+    for (int gy = 0; gy < GLYPH_H; gy++) {
+        for (int gx = 0; gx < GLYPH_W; gx++) {
+            if (!(g[gy] & (0x10 >> gx))) continue;
+
+            for (int py = 0; py < sc; py++) {
+                int fy = y + gy * sc + py;
+                if (fy < 0 || fy >= LCD_H) continue;
+                uint16_t *row = fb + fy * LCD_W;
+
+                for (int px = 0; px < sc; px++) {
+                    int fx = x + gx * sc + px;
+                    if (fx >= 0 && fx < LCD_W) row[fx] = col;
+                }
+            }
+        }
+    }
+}
+
+#define TEXT_ADVANCE(sc) ((GLYPH_W + 1) * (sc))    // one blank column between
+
+static void draw_text(uint16_t *fb, int x, int y, const char *s, int sc, uint16_t col)
+{
+    for (int i = 0; s[i]; i++)
+        draw_glyph(fb, x + i * TEXT_ADVANCE(sc), y, s[i], sc, col);
+}
+
+static int text_width(const char *s, int sc)
+{
+    int n = 0;
+    while (s[n]) n++;
+    return n * TEXT_ADVANCE(sc) - sc;               // trailing gap doesn't count
+}
+
+static void draw_text_centered(uint16_t *fb, int y, const char *s, int sc, uint16_t col)
+{
+    draw_text(fb, (LCD_W - text_width(s, sc)) / 2, y, s, sc, col);
+}
 
 // ---------------------------------------------------------------- audio
 
@@ -93,15 +221,13 @@ static const uint8_t btn_to_key[] = {
 #define SAMPLE_RATE   22050
 #define BEEP_HZ       880
 #define BEEP_AMP      8000
-#define BEEP_MS       80
-
 
 #define AUDIO_CHUNK   1536
 #define BEEP_HALF     (SAMPLE_RATE / (BEEP_HZ * 2))
 
 static i2s_chan_handle_t audio_tx = NULL;
 
-static int      beep_remaining = 0;   // samples of tone left to play; 0 = silent
+static int      beep_remaining = 0;   // samples of tone left; 0 = silent
 static uint32_t beep_phase     = 0;   // persists across frames -- no seam click
 static int16_t  audio_buf[AUDIO_CHUNK];
 
@@ -132,7 +258,6 @@ static void audio_init(void)
     ESP_ERROR_CHECK(i2s_channel_enable(audio_tx));
 }
 
-
 static void audio_beep_ms(int ms)
 {
     beep_remaining = SAMPLE_RATE * ms / 1000;
@@ -142,9 +267,7 @@ static void audio_beep_ms(int ms)
 // the underrun gauge.
 static size_t audio_feed(void)
 {
-    if (beep_remaining <= 0) {
-        return 0;
-    }
+    if (beep_remaining <= 0) return 0;
 
     int n = beep_remaining < AUDIO_CHUNK ? beep_remaining : AUDIO_CHUNK;
 
@@ -191,9 +314,8 @@ static btn_state_t btns[BTN_COUNT];
 static void buttons_init(void)
 {
     uint64_t mask = 0;
-    for (int i = 0; i < BTN_COUNT; i++) {
+    for (int i = 0; i < BTN_COUNT; i++)
         mask |= (1ULL << btn_gpios[i]);   // 1ULL: pin_bit_mask is uint64_t
-    }
 
     gpio_config_t btn_cfg = {
         .pin_bit_mask = mask,
@@ -248,13 +370,88 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
     return hp_task_awoken == pdTRUE;
 }
 
-// ---------------------------------------------------------------- glue
-//
-// This is the whole port. update() and render() keep the exact signatures
-// Step 8 designed them with; the CHIP-8 core dropped into the socket and
-// nothing around it moved.
+// ---------------------------------------------------------------- menu
 
-// Frontend -> core: physical buttons become hex keypad state.
+// Locked selection: once a ROM is chosen the menu is gone until reset. That
+// keeps all four buttons available to the emulated keypad, which is the
+// binding constraint -- there is no spare button for a "back to menu" combo
+// that some ROM won't also want.
+typedef enum { MODE_MENU, MODE_RUN } mode_t;
+
+static mode_t mode      = MODE_MENU;
+static int    menu_sel  = 0;
+static bool   menu_dirty = true;   // only redraw when something changed
+
+// Returns true when a ROM was picked.
+static bool menu_update(void)
+{
+    if (btn_went_down(BTN_UP)) {
+        menu_sel = (menu_sel - 1 + ROM_COUNT) % ROM_COUNT;
+        menu_dirty = true;
+        audio_beep_ms(30);
+    }
+    if (btn_went_down(BTN_DOWN)) {
+        menu_sel = (menu_sel + 1) % ROM_COUNT;
+        menu_dirty = true;
+        audio_beep_ms(30);
+    }
+    // Either of the remaining two selects, so you don't have to remember
+    // which physical switch is which.
+    if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT)) {
+        audio_beep_ms(120);
+        return true;
+    }
+    return false;
+}
+
+static void menu_render(uint16_t *fb)
+{
+    if (!menu_dirty) return;      // static screen; no reason to repaint
+    menu_dirty = false;
+
+    for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_BG;
+
+    draw_text_centered(fb, 24, "CHIP-8", 5, COLOR_FG);
+    draw_text_centered(fb, 70, "SELECT A GAME", 2, COLOR_DIM);
+
+    for (int i = 0; i < ROM_COUNT; i++) {
+        int y   = 110 + i * 44;
+        bool on = (i == menu_sel);
+
+        if (on) draw_glyph(fb, 40, y, '>', 4, COLOR_SEL);
+        draw_text(fb, 80, y, roms[i].name, 4, on ? COLOR_FG : COLOR_DIM);
+    }
+}
+
+// ---------------------------------------------------------------- glue
+
+// One-frame phosphor decay. CHIP-8 has no sprite erase -- moving anything
+// means XOR it off then XOR it on at the new spot, two DXYN instructions
+// apart, and between them the sprite genuinely isn't in display[]. Sampling
+// that at frame rate catches the gap sometimes, which is the flicker.
+static uint8_t persist[CHIP8_DISPLAY_W * CHIP8_DISPLAY_H];
+
+static void rom_start(const rom_t *r, uint16_t *fb)
+{
+    active_rom = r;
+
+    chip8_init(&chip);
+    if (!chip8_load(&chip, r->data, r->len)) {
+        ESP_LOGE("chip8", "ROM load failed: %s (%u bytes)", r->name, r->len);
+        abort();
+    }
+
+    memset(persist, 0, sizeof(persist));
+
+    // Letterbox bars: painted once here, never touched by render() again.
+    for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_LETTER;
+
+    ESP_LOGI("chip8", "running %s: %u bytes, %d cycles/frame, %d timer ticks/frame",
+             r->name, r->len, CYCLES_PER_FRAME, TIMER_TICKS_PER_FRAME);
+}
+
+// Frontend -> core: physical buttons become hex keypad state, through the
+// active ROM's own mapping.
 static void input_to_keys(void)
 {
     for (int i = 0; i < 16; i++)
@@ -262,7 +459,7 @@ static void input_to_keys(void)
 
     for (int b = 0; b < BTN_COUNT; b++)
         if (btn_down(b))
-            chip.keys[btn_to_key[b]] = true;
+            chip.keys[active_rom->keys[b]] = true;
 }
 
 static void update(void)
@@ -275,29 +472,23 @@ static void update(void)
     for (int i = 0; i < TIMER_TICKS_PER_FRAME; i++)
         chip8_tick_timers(&chip);
 
-    // Core -> frontend: sound timer nonzero means "make noise". Re-armed
-    // every frame from the CURRENT timer value, so the beep always ends
-    // exactly when the timer does. Re-arming is safe because beep_phase
+    // Core -> frontend: re-armed every frame from the CURRENT timer value, so
+    // the beep ends exactly when the timer does. Safe because beep_phase
     // persists -- the waveform doesn't restart, so there's no click.
     if (chip.sound_timer > 0)
         audio_beep_ms(chip.sound_timer * 1000 / TIMER_HZ);
 }
 
-// 64x32 -> 320x160, nearest-neighbour at 5x. Only the image band is written;
-// the letterbox bars are painted once before the loop and never change.
-//
-// Each source row expands to 5 identical destination rows, so build one and
-// memcpy it 4 times rather than running the inner loop 5 times. 51200 pixel
-// writes plus 4 row copies, against the 76800 a full-frame clear would cost.
-static uint8_t persist[CHIP8_DISPLAY_W * CHIP8_DISPLAY_H];
+// 64x32 -> 320x160, nearest-neighbour at 5x. Each source row expands to 5
+// identical destination rows, so build one and memcpy it 4 times.
 static void render(uint16_t *fb)
 {
-    for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++){
+    for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++)
         persist[i] = chip.display[i] ? 2 : (persist[i] ? persist[i] - 1 : 0);
-    }
+
     for (int cy = 0; cy < CHIP8_DISPLAY_H; cy++) {
         uint16_t      *row0 = fb + (IMG_Y0 + cy * SCALE) * LCD_W + IMG_X0;
-        const uint8_t *src = persist + cy * CHIP8_DISPLAY_W;
+        const uint8_t *src  = persist + cy * CHIP8_DISPLAY_W;
 
         for (int cx = 0; cx < CHIP8_DISPLAY_W; cx++) {
             uint16_t  col = src[cx] ? COLOR_FG : COLOR_BG;
@@ -350,9 +541,7 @@ void app_main(void)
     trans_done_sem = xSemaphoreCreateBinary();
     assert(trans_done_sem != NULL);
 
-    esp_lcd_panel_io_callbacks_t cbs = {
-        .on_color_trans_done = on_color_trans_done,
-    };
+    esp_lcd_panel_io_callbacks_t cbs = { .on_color_trans_done = on_color_trans_done };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(io, &cbs, NULL));
 
     // 3. Panel
@@ -381,32 +570,16 @@ void app_main(void)
     ESP_LOGI("fb", "framebuffer at %p, %u bytes, %dx%d",
              fb, (unsigned)fb_size, LCD_W, LCD_H);
 
-    // Letterbox bars: painted once. render() never touches these rows again,
-    // which is why the per-frame render cost is below Snake's despite the
-    // scaler doing more work per pixel.
-    for (int i = 0; i < LCD_W * LCD_H; i++)
-        fb[i] = COLOR_LETTER;
-
     // 5. Input
     buttons_init();
 
     // 6. Audio
     audio_init();
 
-    // 7. Emulator
     srand((unsigned)esp_timer_get_time());
-    chip8_init(&chip);
-    if (!chip8_load(&chip, pong_ch8, pong_ch8_len)) {
-        ESP_LOGE("chip8", "ROM load failed (%u bytes)", pong_ch8_len);
-        abort();
-    }
-    ESP_LOGI("chip8", "loaded %u bytes, pc=0x%03X, %d cycles/frame, %d timer ticks/frame",
-             pong_ch8_len, chip.pc, CYCLES_PER_FRAME, TIMER_TICKS_PER_FRAME);
+    ESP_LOGI("menu", "%d ROMs available", ROM_COUNT);
 
     int frame = 0;
-
-    // Absolute deadline: += FRAME_US, never "now + FRAME_US", so a long frame
-    // is followed by a short one and the average rate holds with no drift.
     int64_t next_frame = esp_timer_get_time();
 
     // ------------------------------------------------------------ game loop
@@ -414,34 +587,44 @@ void app_main(void)
         next_frame += FRAME_US;
         int64_t t0 = esp_timer_get_time();
 
-        // --- input
         buttons_poll();
         int64_t t_input = esp_timer_get_time();
 
-        //Reboot if whiteout
+        // Panel recovery. The breadboard display can lose its init under
+        // mechanical disturbance -- 14 contacts on one cantilevered edge.
+        // This is a mitigation, not a fix; the fix is the Stage B carrier.
         if (btn_down(BTN_LEFT) && btn_down(BTN_RIGHT)) {
             ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
             ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
             ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, true));
             ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, LCD_MIRROR_X, LCD_MIRROR_Y));
             ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
-            for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_LETTER;  // repaint bars
+            if (mode == MODE_RUN) {
+                for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_LETTER;
+            } else {
+                menu_dirty = true;
+            }
             ESP_LOGW("lcd", "panel re-initialized");
-    }
+        }
 
-        // --- update: CHIP8_HZ worth of emulation, then the 60 Hz timers
-        update();
+        if (mode == MODE_MENU) {
+            if (menu_update()) {
+                rom_start(&roms[menu_sel], fb);
+                mode = MODE_RUN;
+            }
+        } else {
+            update();
+        }
         int64_t t_update = esp_timer_get_time();
 
-        // --- audio top-up, non-blocking
         size_t audio_bytes = audio_feed();
         int64_t t_audio = esp_timer_get_time();
 
-        // --- render the 64x32 buffer into the framebuffer at 5x
-        render(fb);
+        if (mode == MODE_MENU) menu_render(fb);
+        else                   render(fb);
         int64_t t_render = esp_timer_get_time();
 
-        // --- push. Queues the DMA transfer and returns; does not block.
+        // Queues the DMA transfer and returns; does not block.
         esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);
         int64_t t_cpu = esp_timer_get_time();
 
@@ -449,7 +632,6 @@ void app_main(void)
         xSemaphoreTake(trans_done_sem, portMAX_DELAY);
         int64_t t_done = esp_timer_get_time();
 
-        // --- frame clock: sleep off whatever budget remains
         int64_t now = esp_timer_get_time();
         if (next_frame > now) {
             vTaskDelay(pdMS_TO_TICKS((next_frame - now) / 1000));
@@ -458,15 +640,14 @@ void app_main(void)
         }
 
         // The core sets a flag rather than printing -- ESP_LOGI blocks on
-        // UART for ~82 us, and an unimplemented opcode inside a loop would
-        // otherwise drag the frame clock. Report once, then clear.
+        // UART for ~82 us, and a bad opcode in a loop would drag the clock.
         if (chip.bad_op) {
             ESP_LOGW("chip8", "unimplemented opcode 0x%04X at 0x%03X",
                      chip.bad_opcode, chip.bad_pc);
             chip.bad_op = false;
         }
 
-        if (++frame % 30 == 0) {
+        if (++frame % 30 == 0 && mode == MODE_RUN) {
             ESP_LOGI("perf",
                      "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us",
                      t_input  - t0,
