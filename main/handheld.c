@@ -36,8 +36,7 @@
 #define LCD_MIRROR_Y  false
 
 // Fixed frame clock. 50 ms = 20 fps -- Step 4's measured worst case.
-#define FRAME_US  50000
-
+#define FRAME_US 41000
 // ---------------------------------------------------------------- chip-8
 
 // Emulated rates, stated as RATES rather than per-frame counts so they stay
@@ -290,11 +289,15 @@ static void update(void)
 // Each source row expands to 5 identical destination rows, so build one and
 // memcpy it 4 times rather than running the inner loop 5 times. 51200 pixel
 // writes plus 4 row copies, against the 76800 a full-frame clear would cost.
+static uint8_t persist[CHIP8_DISPLAY_W * CHIP8_DISPLAY_H];
 static void render(uint16_t *fb)
 {
+    for (int i = 0; i < CHIP8_DISPLAY_W * CHIP8_DISPLAY_H; i++){
+        persist[i] = chip.display[i] ? 2 : (persist[i] ? persist[i] - 1 : 0);
+    }
     for (int cy = 0; cy < CHIP8_DISPLAY_H; cy++) {
         uint16_t      *row0 = fb + (IMG_Y0 + cy * SCALE) * LCD_W + IMG_X0;
-        const uint8_t *src  = chip.display + cy * CHIP8_DISPLAY_W;
+        const uint8_t *src = persist + cy * CHIP8_DISPLAY_W;
 
         for (int cx = 0; cx < CHIP8_DISPLAY_W; cx++) {
             uint16_t  col = src[cx] ? COLOR_FG : COLOR_BG;
