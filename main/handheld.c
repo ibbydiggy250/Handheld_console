@@ -415,6 +415,17 @@ void app_main(void)
         buttons_poll();
         int64_t t_input = esp_timer_get_time();
 
+        //Reboot if whiteout
+        if (btn_down(BTN_LEFT) && btn_down(BTN_RIGHT)) {
+            ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
+            ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+            ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, true));
+            ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, LCD_MIRROR_X, LCD_MIRROR_Y));
+            ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+            for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_LETTER;  // repaint bars
+            ESP_LOGW("lcd", "panel re-initialized");
+    }
+
         // --- update: CHIP8_HZ worth of emulation, then the 60 Hz timers
         update();
         int64_t t_update = esp_timer_get_time();
