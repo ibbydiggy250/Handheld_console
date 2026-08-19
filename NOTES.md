@@ -154,6 +154,8 @@ Frame timing is deterministic to the microsecond (~0.02% jitter). A/B deltas of 
 
 ## Step log
 
+
+### Phase 1
 - **1 — Toolchain + blink.** ✅ Aug 1. Build → flash → monitor proven. WS2812 on GPIO38 via `led_strip`/RMT.
 - **2 — Display.** ✅ Aug 1. ILI9341 cycling full-screen R/G/B over SPI.
 - **3 — PSRAM framebuffer + DMA.** ✅ Aug 2. 4.62× faster, 95% of CPU recovered.
@@ -169,3 +171,8 @@ Frame timing is deterministic to the microsecond (~0.02% jitter). A/B deltas of 
 - **11e — ROM table + menu.** ✅ Aug 9. `rom_t` + 40-glyph 5×7 hand-built font; menu repaints only on selection change. Selection locked updatuntil reset — all four buttons are consumed by the emulated keypad. Tetris (494 B) runs at `update` 15–33 µs. Its silence confirmed *correct* by instrumenting `sound_timer` rather than assuming a bug — the ROM never writes `FX18`. **Phase 1 Stage A complete.**
 
 **Deferred:** SD — only needed for Phase 2 DMG ROMs, dual core — closed twice on measurement, power — pending LiPo parts.
+
+### Phase 3
+
+- **3.0 — Save state serializer.** ✅ Aug 18. Platform-agnostic `chip8_state.c`: magic + version + 16 B ROM name + machine state, explicit LE field-by-field (never a struct `memcpy` — padding/endianness differ across ESP32 → Postgres → WASM), 4429 B with the display bitpacked 2048 → 256. Excludes `keys` (repolled), `bad_op` (transient), phosphor buffer (frontend-side). Deserialize validates and decodes into a scratch `Chip8` so a bad blob can't half-write the live one — 6 KB of stack, revisit against the ESP32 task stack at 3.5. Blob carries its own `mem`, so it restores with no ROM argument — the property the web app needs. **Found on the way: the laptop build had been broken since 11a** — `chip8_load_rom` deleted from `chip8.c`, `chip8_file.c` never written, every validation since ran on hardware. Implicit declaration is only a warning; it failed at link. Added `-Werror=implicit-function-declaration`. Desktop-proves-first only holds if the desktop build is still built.
+- - **3.1 — WiFi station.** ✅ Aug 18. Non-blocking `esp_wifi` STA in `wifi.c`; `wifi_start()` returns with the radio scanning and association completes on the event task, so the game loop never waits on the radio. Credentials in a gitignored `wifi_secret.h`. `threshold.authmode = WPA2_PSK` over the IDF default (OPEN), which would let the driver associate to a rogue open AP with the same SSID. **WiFi cost is unmeasurable in the frame budget** — `work` held ~39,989 µs through scanning and association, so the core-pinning question closed before it needed answering, third time a step closed on measurement. Google Wifi's single SSID is a non-issue: band steering puts 2.4 GHz-only clients on 2.4 GHz, and the usual mesh failure is phone-app provisioning, which firmware with a hardcoded SSID skips entirely. Two gotchas: **adding any `REQUIRES` to `main` disables the implicit common-component set**, so every include must then be listed explicitly — presents as a working build failing on headers you didn't touch. And a header-only edit to `wifi_secret.h` didn't take; `idf.py fullclean` was needed. Disconnect `reason` code is the whole diagnostic: 201 = AP not found, 15 = wrong password.

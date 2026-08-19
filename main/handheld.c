@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "wifi.h"
 #include "chip8.h"
 #include "rom_pong.h"
 #include "rom_tetris.h"
@@ -576,6 +577,8 @@ void app_main(void)
     // 6. Audio
     audio_init();
 
+    // 7. WiFi. Non-blocking -- returns with the radio scanning.
+    wifi_start();
     srand((unsigned)esp_timer_get_time());
     ESP_LOGI("menu", "%d ROMs available", ROM_COUNT);
 
@@ -649,14 +652,15 @@ void app_main(void)
 
         if (++frame % 30 == 0 && mode == MODE_RUN) {
             ESP_LOGI("perf",
-                     "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us",
+                     "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us | wifi %d",
                      t_input  - t0,
                      t_update - t_input,
                      t_audio  - t_update, (unsigned)audio_bytes,
                      t_render - t_audio,
                      t_cpu    - t0,
                      t_done   - t0,
-                     esp_timer_get_time() - t0);
+                     esp_timer_get_time() - t0,
+                     wifi_is_connected());
         }
     }
 }

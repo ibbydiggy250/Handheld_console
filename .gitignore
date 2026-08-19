@@ -25,3 +25,6 @@ Thumbs.db
 *~
 
 # --- Build ----
+
+# ---Main---
+main/wifi_secret.h
