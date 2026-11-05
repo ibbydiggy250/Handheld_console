@@ -36,9 +36,9 @@ Snake was written first as a validation game and removed once the emulator repla
 
 | Function | Pins |
 |---|---|
-| Display (SPI2) | SCK=12, MOSI=11, MISO=13, CS=10, DC=14, RST=15, BL=16 |
+| Display (SPI2) | SCK=12, MOSI=11, MISO=13, CS=10, DC=14, RST=8, BL=9 |
 | Buttons | 4, 5, 6, 7 — internal pull-up, switch to ground |
-| Audio | BCLK=42, LRC=41, DIN=40, Vin=3V3 (GAIN and SD left floating) |
+| Audio | LRC=40, BCLK=41, DIN=42, Vin=3V3 (GAIN and SD left floating) |
 
 GPIO 26–37 are unavailable — the octal PSRAM owns them.
 

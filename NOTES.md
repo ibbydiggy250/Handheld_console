@@ -19,9 +19,9 @@ Measurements, constraints, and the decisions they forced.
 
 | Function | Pins |
 |---|---|
-| Display (SPI2) | SCK=12, MOSI=11, MISO=13, CS=10, DC=14, RST=15, BL=16 |
+| Display (SPI2) | SCK=12, MOSI=11, MISO=13, CS=10, DC=14, RST=8, BL=9 |
 | Buttons | 4, 5, 6, 7 — internal pull-up, switch to ground, active low |
-| Audio | BCLK=42, LRC=41, DIN=40, Vin=3V3, GAIN/SD floating |
+| Audio | LRC=40, BCLK=41, DIN=42, Vin=3V3, GAIN/SD floating |
 | Onboard WS2812 | **GPIO38**, not 48 (v1.1 board rev) |
 | Unusable | 26–37 (octal PSRAM), 0/3/45/46 (strapping), 19/20 (USB) |
 
@@ -84,7 +84,7 @@ Frame timing is deterministic to the microsecond (~0.02% jitter). A/B deltas of 
 
 - **Framebuffer stored pre-byte-swapped.** Pixel path is palette-index based, so the swap folds into the palette LUT at zero per-pixel cost. Swapping at push time = a 76,800-word CPU pass exactly when DMA is supposed to have freed the CPU.
 - **`esp_lcd` over LovyanGFX.** The DMA framebuffer is the portfolio claim; LovyanGFX's sprite system would own that buffer. Still available later for fonts.
-- **Backlight on GPIO16, not 3V3.** Largest single power draw (~60–100 mA); Step 10 needs it switchable. Side effect: dark panel at boot is expected.
+- **Backlight on GPIO9, not 3V3.** Largest single power draw (~60–100 mA); Step 10 needs it switchable. Side effect: dark panel at boot is expected.
 - **40 MHz SPI**, 2.7× over the datasheet's ~15 MHz. No artifacts on breadboard jumpers.
 - **Buttons on RTC-capable GPIOs (4–9).** `esp_sleep_enable_ext1_wakeup()` requires RTC pins; only 0–21 qualify. Preserves deep-sleep wake for Step 10.
 - **Audio on non-RTC pins (40–42).** The complement — I2S never needs to wake the chip, so it spends the pins that can't.

@@ -18,6 +18,7 @@
 
 #include "wifi.h"
 #include "chip8.h"
+#include "net.h"
 #include "rom_pong.h"
 #include "rom_tetris.h"
 
@@ -26,16 +27,18 @@
 #define PIN_MISO  13
 #define PIN_CS    10
 #define PIN_DC    14
-#define PIN_RST   15
-#define PIN_BL    16
+#define PIN_RST   8
+#define PIN_BL    9
 
 // LANDSCAPE. Panel is natively 240x320 portrait; swap_xy + mirror rotate it,
 // so the framebuffer is addressed 320 wide x 240 tall. Same 153600 bytes.
 #define LCD_W 320
 #define LCD_H 240
 
-#define LCD_MIRROR_X  false
-#define LCD_MIRROR_Y  false
+// Both flipped = 180 degrees relative to the original mount. Flipping only
+// one axis gives a mirror image, not a rotation.
+#define LCD_MIRROR_X  true
+#define LCD_MIRROR_Y  true
 
 // 41 ms. Measured floor at 40 MHz SPI: work lands at ~39990 us, of which
 // 30720 us is the irreducible payload time for 153600 bytes. Going lower
@@ -43,6 +46,8 @@
 // what actually fixed the CHIP-8 XOR flicker -- narrowing the sampling gap
 // beat masking it with a longer persistence decay.
 #define FRAME_US  41000
+// 12 frames at 41 ms ~= 500 ms.
+#define CHORD_FRAMES 12
 
 // ---------------------------------------------------------------- chip-8
 
@@ -215,9 +220,9 @@ static void draw_text_centered(uint16_t *fb, int y, const char *s, int sc, uint1
 
 // ---------------------------------------------------------------- audio
 
-#define PIN_I2S_BCLK  GPIO_NUM_42
-#define PIN_I2S_WS    GPIO_NUM_41
-#define PIN_I2S_DOUT  GPIO_NUM_40
+#define PIN_I2S_BCLK  GPIO_NUM_41
+#define PIN_I2S_WS    GPIO_NUM_40   // LRC on the amp breakout
+#define PIN_I2S_DOUT  GPIO_NUM_42   // DIN on the amp breakout
 
 #define SAMPLE_RATE   22050
 #define BEEP_HZ       880
@@ -299,7 +304,10 @@ static size_t audio_feed(void)
 #define BTN_DOWN   3
 #define BTN_COUNT  4
 
-static const int btn_gpios[BTN_COUNT] = { 4, 5, 6, 7 };
+// 2x2 layout: left column (GPIO 4/5) is up/down, right column (GPIO 6/7) is
+// select. Pong's left paddle rides UP/DOWN, so the left column drives the
+// left paddle.
+static const int btn_gpios[BTN_COUNT] = { 6, 7, 4, 5 };   // LEFT, RIGHT, UP, DOWN
 
 #define DEBOUNCE_SAMPLES 2
 
@@ -579,6 +587,8 @@ void app_main(void)
 
     // 7. WiFi. Non-blocking -- returns with the radio scanning.
     wifi_start();
+    net_start();
+    
     srand((unsigned)esp_timer_get_time());
     ESP_LOGI("menu", "%d ROMs available", ROM_COUNT);
 
@@ -608,6 +618,20 @@ void app_main(void)
                 menu_dirty = true;
             }
             ESP_LOGW("lcd", "panel re-initialized");
+        }
+                /* All four held: fire one test request. Held-count, not edge, for
+           the same reason debounce is sample-count -- a transient four-way
+           overlap during frantic input shouldn't trigger it. */
+        {
+            static int chord = 0;
+            bool all_down = true;
+            for (int i = 0; i < BTN_COUNT; i++)
+                if (!btn_down(i)) { all_down = false; break; }
+
+            chord = all_down ? chord + 1 : 0;
+
+            if (chord == CHORD_FRAMES)      // == : fires once per hold
+                net_request();
         }
 
         if (mode == MODE_MENU) {
@@ -652,7 +676,7 @@ void app_main(void)
 
         if (++frame % 30 == 0 && mode == MODE_RUN) {
             ESP_LOGI("perf",
-                     "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us | wifi %d",
+                     "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us | wifi %d | net %d",
                      t_input  - t0,
                      t_update - t_input,
                      t_audio  - t_update, (unsigned)audio_bytes,
@@ -660,7 +684,8 @@ void app_main(void)
                      t_cpu    - t0,
                      t_done   - t0,
                      esp_timer_get_time() - t0,
-                     wifi_is_connected());
+                     wifi_is_connected(),
+                     net_last_status());
         }
     }
 }

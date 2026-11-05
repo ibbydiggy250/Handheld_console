@@ -28,3 +28,12 @@ Thumbs.db
 
 # ---Main---
 main/wifi_secret.h
+
+# --- KiCad ---
+# Local history is its own nested git repo; lock files and per-user
+# project state (.kicad_prl) are machine-local.
+.history/
+*.lck
+*.kicad_prl
+*-backups/
+fp-info-cache
