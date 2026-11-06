@@ -16,7 +16,7 @@ syncing save states to a Supabase backend with a React frontend.
 
 ## Repos
 
-- Handheld firmware: `C:\esp\projects\handheld` (ESP-IDF v6.0.2)
+- Handheld firmware: this repo (`C:\Users\imibr\OneDrive\Documents\handheld`), sources in `main\` (ESP-IDF v6.0.2)
 - CHIP-8 laptop build: `chip8\dev\` (MSYS2 mingw64 gcc, raylib, mingw32-make)
 - Build/flash: `idf.py -p COM3 flash monitor` from the ESP-IDF PowerShell, run from project root
 - Laptop build has `-Werror=implicit-function-declaration` — it was once silently broken for weeks
