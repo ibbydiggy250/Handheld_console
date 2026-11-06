@@ -28,6 +28,7 @@ Thumbs.db
 
 # ---Main---
 main/wifi_secret.h
+backend/sb.env
 
 # --- KiCad ---
 # Local history is its own nested git repo; lock files and per-user

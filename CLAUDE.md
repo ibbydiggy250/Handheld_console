@@ -52,11 +52,14 @@ syncing save states to a Supabase backend with a React frontend.
 
 Done: 3.0 serializer (4,429 B blob, magic `C8ST`, explicit little-endian) · 3.1 WiFi STA
 (`wifi.c`, creds in gitignored `wifi_secret.h`) · 3.2 HTTPS GET via cert bundle (`net.c`,
-triggered by 4-button chord held 12 frames).
+triggered by 4-button chord held 12 frames) · 3.3 Supabase `save_states` + private `saves`
+bucket + RLS (`backend/schema.sql`, 12/12 curl tests) and session-mint spike passed (11/11) —
+Edge Function `generateLink` → `verifyOtp` works.
+
+Supabase: URL + publishable key in gitignored `backend/sb.env` (`source` it in Git Bash).
+Test users `usera@example.com` / `userb@example.com`. Edge Function URL slug ≠ display name.
 
 Remaining:
-- **3.3** Supabase: private bucket, `save_states` table, RLS on both. Validate entirely with curl.
-  Also spike: can an Edge Function mint a device session (admin `generateLink` → `verifyOtp`)?
 - **3.4** Device pairing (code flow): `device_codes` table + issue/poll Edge Functions →
   pairing screen + polling in `net.c`, refresh token in NVS → React "Link device" page
 - **3.5** Upload: blob first, then metadata row. Queue + retry.
