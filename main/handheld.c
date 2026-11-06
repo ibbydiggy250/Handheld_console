@@ -385,22 +385,28 @@ static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
 // keeps all four buttons available to the emulated keypad, which is the
 // binding constraint -- there is no spare button for a "back to menu" combo
 // that some ROM won't also want.
-typedef enum { MODE_MENU, MODE_RUN } mode_t;
+// The pairing screen is the exception: it isn't a ROM, owns no keypad, and
+// can return to the menu.
+typedef enum { MODE_MENU, MODE_RUN, MODE_PAIR } mode_t;
 
 static mode_t mode      = MODE_MENU;
 static int    menu_sel  = 0;
 static bool   menu_dirty = true;   // only redraw when something changed
 
-// Returns true when a ROM was picked.
+// Menu = every ROM, then LINK DEVICE as the last row.
+#define MENU_LINK   ROM_COUNT
+#define MENU_COUNT  (ROM_COUNT + 1)
+
+// Returns true when an item was picked.
 static bool menu_update(void)
 {
     if (btn_went_down(BTN_UP)) {
-        menu_sel = (menu_sel - 1 + ROM_COUNT) % ROM_COUNT;
+        menu_sel = (menu_sel - 1 + MENU_COUNT) % MENU_COUNT;
         menu_dirty = true;
         audio_beep_ms(30);
     }
     if (btn_went_down(BTN_DOWN)) {
-        menu_sel = (menu_sel + 1) % ROM_COUNT;
+        menu_sel = (menu_sel + 1) % MENU_COUNT;
         menu_dirty = true;
         audio_beep_ms(30);
     }
@@ -423,13 +429,109 @@ static void menu_render(uint16_t *fb)
     draw_text_centered(fb, 24, "CHIP-8", 5, COLOR_FG);
     draw_text_centered(fb, 70, "SELECT A GAME", 2, COLOR_DIM);
 
-    for (int i = 0; i < ROM_COUNT; i++) {
-        int y   = 110 + i * 44;
+    // Scale 3 so "LINK DEVICE" (11 glyphs, 195 px) fits beside the cursor.
+    for (int i = 0; i < MENU_COUNT; i++) {
+        int y   = 104 + i * 36;
         bool on = (i == menu_sel);
+        const char *label = (i == MENU_LINK) ? "LINK DEVICE" : roms[i].name;
 
-        if (on) draw_glyph(fb, 40, y, '>', 4, COLOR_SEL);
-        draw_text(fb, 80, y, roms[i].name, 4, on ? COLOR_FG : COLOR_DIM);
+        if (on) draw_glyph(fb, 30, y, '>', 3, COLOR_SEL);
+        draw_text(fb, 60, y, label, 3, on ? COLOR_FG : COLOR_DIM);
     }
+}
+
+// ---------------------------------------------------------------- pairing screen
+//
+// All the network work happens on the net task (net.c). This side only reads
+// a snapshot each frame and repaints when what's on screen would change.
+
+static bool        pair_dirty = true;
+static pair_view_t pair_shown;          // what's currently painted
+static int         pair_shown_min = -1; // minutes-left currently painted
+
+static void pair_enter(void)
+{
+    net_pair_start();
+    pair_dirty = true;
+    pair_shown_min = -1;
+}
+
+// Returns true when the user backs out to the menu.
+static bool pair_update(void)
+{
+    if (btn_went_down(BTN_LEFT) || btn_went_down(BTN_RIGHT)) {
+        net_pair_cancel();          // no-op once linked; the session is kept
+        audio_beep_ms(60);
+        return true;
+    }
+    return false;
+}
+
+static void pair_render(uint16_t *fb)
+{
+    pair_view_t v;
+    net_pair_view(&v);
+
+    int min_left = -1;
+    if (v.state == PAIR_SHOW_CODE) {
+        int64_t left = v.expires_us - esp_timer_get_time();
+        min_left = left > 0 ? (int)((left + 59999999) / 60000000) : 0;  // round up
+    }
+
+    if (!pair_dirty && v.state == pair_shown.state &&
+        strcmp(v.code, pair_shown.code) == 0 && min_left == pair_shown_min)
+        return;
+
+    // Chirp once when the link lands -- the user is looking at the browser.
+    if (v.state == PAIR_LINKED && pair_shown.state != PAIR_LINKED && !pair_dirty)
+        audio_beep_ms(250);
+
+    pair_dirty = false;
+    pair_shown = v;
+    pair_shown_min = min_left;
+
+    for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_BG;
+    draw_text_centered(fb, 20, "LINK DEVICE", 3, COLOR_FG);
+
+    switch (v.state) {
+    case PAIR_IDLE:
+    case PAIR_REQUESTING:
+        draw_text_centered(fb, 110, "GETTING CODE...", 2, COLOR_DIM);
+        break;
+
+    case PAIR_NO_WIFI:
+        draw_text_centered(fb, 110, "WAITING FOR WIFI...", 2, COLOR_DIM);
+        break;
+
+    case PAIR_ERROR:
+        draw_text_centered(fb, 100, "NETWORK ERROR", 2, COLOR_FG);
+        draw_text_centered(fb, 125, "RETRYING...", 2, COLOR_DIM);
+        break;
+
+    case PAIR_SHOW_CODE: {
+        // "A9YM7G" -> "A9Y-M7G", the same grouping the web app shows.
+        char shown[8];
+        memcpy(shown, v.code, 3);
+        shown[3] = '-';
+        memcpy(shown + 4, v.code + 3, 3);
+        shown[7] = '\0';
+
+        draw_text_centered(fb, 70, shown, 6, COLOR_FG);           // 246 px wide
+        draw_text_centered(fb, 135, "ENTER THIS CODE", 2, COLOR_DIM);
+        draw_text_centered(fb, 157, "ON THE WEB APP", 2, COLOR_DIM);
+
+        char exp[24];
+        snprintf(exp, sizeof(exp), "EXPIRES IN %d MIN", min_left);
+        draw_text_centered(fb, 185, exp, 2, COLOR_DIM);
+        break;
+    }
+
+    case PAIR_LINKED:
+        draw_text_centered(fb, 90, "LINKED", 5, COLOR_SEL);
+        break;
+    }
+
+    draw_text_centered(fb, 218, "SELECT - BACK", 2, COLOR_DIM);
 }
 
 // ---------------------------------------------------------------- glue
@@ -544,6 +646,13 @@ void app_main(void)
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        // DMA straight from the PSRAM framebuffer. Without this the SPI
+        // driver mallocs a 153,600 B *internal* bounce buffer and memcpys the
+        // frame into it every frame -- and when a TLS handshake has the
+        // internal heap fragmented, that malloc fails and the frame is lost.
+        // fb is 64-byte aligned and 153,600 is a multiple of 64, so the
+        // driver only has to write the cache back (esp_cache_msync).
+        .flags.psram_dma_direct = true,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_cfg, &io));
 
@@ -614,6 +723,8 @@ void app_main(void)
             ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
             if (mode == MODE_RUN) {
                 for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = COLOR_LETTER;
+            } else if (mode == MODE_PAIR) {
+                pair_dirty = true;
             } else {
                 menu_dirty = true;
             }
@@ -636,8 +747,18 @@ void app_main(void)
 
         if (mode == MODE_MENU) {
             if (menu_update()) {
-                rom_start(&roms[menu_sel], fb);
-                mode = MODE_RUN;
+                if (menu_sel == MENU_LINK) {
+                    pair_enter();
+                    mode = MODE_PAIR;
+                } else {
+                    rom_start(&roms[menu_sel], fb);
+                    mode = MODE_RUN;
+                }
+            }
+        } else if (mode == MODE_PAIR) {
+            if (pair_update()) {
+                mode = MODE_MENU;
+                menu_dirty = true;
             }
         } else {
             update();
@@ -647,16 +768,28 @@ void app_main(void)
         size_t audio_bytes = audio_feed();
         int64_t t_audio = esp_timer_get_time();
 
-        if (mode == MODE_MENU) menu_render(fb);
-        else                   render(fb);
+        if      (mode == MODE_MENU) menu_render(fb);
+        else if (mode == MODE_PAIR) pair_render(fb);
+        else                        render(fb);
         int64_t t_render = esp_timer_get_time();
 
         // Queues the DMA transfer and returns; does not block.
-        esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);
+        esp_err_t draw_err = esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb);
         int64_t t_cpu = esp_timer_get_time();
 
         // Single-buffered: must not touch fb until DMA is done reading it.
-        xSemaphoreTake(trans_done_sem, portMAX_DELAY);
+        // But only wait if the transfer was actually queued -- a failed
+        // queue never fires the done callback, and portMAX_DELAY would hang
+        // the loop forever (seen in 3.4c: a dropped frame froze the screen
+        // while the net task finished pairing behind it).
+        if (draw_err == ESP_OK) {
+            xSemaphoreTake(trans_done_sem, portMAX_DELAY);
+        } else {
+            ESP_LOGE("lcd", "draw_bitmap failed: %s -- frame dropped", esp_err_to_name(draw_err));
+            // Static screens only repaint on change; force a resend so a
+            // dropped LINKED frame doesn't stay invisible.
+            menu_dirty = pair_dirty = true;
+        }
         int64_t t_done = esp_timer_get_time();
 
         int64_t now = esp_timer_get_time();
@@ -674,7 +807,9 @@ void app_main(void)
             chip.bad_op = false;
         }
 
-        if (++frame % 30 == 0 && mode == MODE_RUN) {
+        // Logged while pairing too: `work` holding at ~40 ms through TLS
+        // handshakes is the proof the net task never stalls the loop.
+        if (++frame % 30 == 0 && mode != MODE_MENU) {
             ESP_LOGI("perf",
                      "input %lld | update %lld | audio %lld (%u B) | render %lld | cpu %lld | work %lld | frame %lld us | wifi %d | net %d",
                      t_input  - t0,

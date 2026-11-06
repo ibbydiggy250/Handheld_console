@@ -28,6 +28,7 @@ Thumbs.db
 
 # ---Main---
 main/wifi_secret.h
+main/supabase_secret.h
 backend/sb.env
 
 # --- KiCad ---

@@ -15,3 +15,5 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/esp_lcd_ili9341: ^2.0.0
+  # json was removed from IDF in v6.0 -- cJSON now comes from the registry.
+  espressif/cjson: ^1.7.19
